@@ -1,6 +1,7 @@
 import ctypes
 import time
 from ctypes import Structure, c_ubyte, c_ushort, c_ulong, c_bool, POINTER
+from pathlib import Path
 
 # ==============================================================================
 # 1. 定义 CH347 相关数据结构与 API 类型映射
@@ -123,91 +124,123 @@ def transceiver_transfer_8bit_one_shot(dev_index, reg_addr, data_val=0, is_read=
 
 
 # ==============================================================================
-# 3. 运行测试示例
+# 3. 从文本文件加载并执行寄存器操作
 # ==============================================================================
+
+def _parse_integer(token, file_path, line_number, field_name):
+    try:
+        return int(token, 0)
+    except ValueError as exc:
+        raise ValueError(
+            f"{file_path}:{line_number}: {field_name} '{token}' 不是有效整数"
+        ) from exc
+
+
+def load_register_operations(file_path):
+    """读取并校验寄存器操作文件，返回 (命令, 参数...) 列表。"""
+    operations = []
+
+    with file_path.open("r", encoding="utf-8-sig") as register_file:
+        for line_number, raw_line in enumerate(register_file, start=1):
+            line = raw_line.split("//", 1)[0].split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            parts = line.split()
+            command = parts[0].lower()
+
+            if command == "w" and len(parts) == 3:
+                address = _parse_integer(parts[1], file_path, line_number, "地址")
+                value = _parse_integer(parts[2], file_path, line_number, "数据")
+                if not 0 <= address <= 0x7F:
+                    raise ValueError(
+                        f"{file_path}:{line_number}: 地址必须在 0x00 到 0x7F 之间"
+                    )
+                if not 0 <= value <= 0xFF:
+                    raise ValueError(
+                        f"{file_path}:{line_number}: 数据必须在 0x00 到 0xFF 之间"
+                    )
+                operations.append((command, address, value))
+
+            elif command == "r" and len(parts) == 2:
+                address = _parse_integer(parts[1], file_path, line_number, "地址")
+                if not 0 <= address <= 0x7F:
+                    raise ValueError(
+                        f"{file_path}:{line_number}: 地址必须在 0x00 到 0x7F 之间"
+                    )
+                operations.append((command, address))
+
+            elif command == "delay" and len(parts) == 2:
+                delay_ms = _parse_integer(parts[1], file_path, line_number, "延时")
+                if delay_ms < 0:
+                    raise ValueError(
+                        f"{file_path}:{line_number}: 延时不能为负数"
+                    )
+                operations.append((command, delay_ms))
+
+            else:
+                raise ValueError(
+                    f"{file_path}:{line_number}: 不支持的格式 '{line}'；"
+                    "请使用 w <地址> <数据>、r <地址> 或 delay <毫秒>"
+                )
+
+    if not operations:
+        raise ValueError(f"{file_path}: 文件中没有可执行的寄存器操作")
+
+    return operations
+
+
+def execute_register_operations(dev_index, operations):
+    """按文件中的先后顺序执行寄存器操作。"""
+    for operation in operations:
+        command = operation[0]
+
+        if command == "w":
+            _, address, value = operation
+            success, _ = transceiver_transfer_8bit_one_shot(
+                dev_index, reg_addr=address, data_val=value, is_read=False
+            )
+            if not success:
+                return False
+            print(f"[写寄存器成功] 地址 0x{address:02X} <= 0x{value:02X}")
+
+        elif command == "r":
+            _, address = operation
+            success, read_value = transceiver_transfer_8bit_one_shot(
+                dev_index, reg_addr=address, is_read=True
+            )
+            if not success:
+                return False
+            print(f"[读寄存器成功] 地址 0x{address:02X} => 0x{read_value:02X}")
+
+        else:
+            _, delay_ms = operation
+            print(f"[延时] {delay_ms} ms")
+            time.sleep(delay_ms / 1000.0)
+
+    return True
+
+
+def main():
+    dev_index = 0
+    register_list_path = Path(__file__).resolve().with_name("wl160x_reg_list.txt")
+
+    try:
+        operations = load_register_operations(register_list_path)
+    except (OSError, ValueError) as exc:
+        print(f"寄存器列表加载失败: {exc}")
+        return 1
+
+    print(f"已加载 {len(operations)} 条操作: {register_list_path}")
+    if not init_ch347_spi(dev_index):
+        return 1
+
+    try:
+        return 0 if execute_register_operations(dev_index, operations) else 1
+    finally:
+        ch347.CH347CloseDevice(dev_index)
+        print("设备已关闭。")
+
+
 if __name__ == "__main__":
-    DEV_IDX = 0
-    
-    # 初始化 SPI
-    if init_ch347_spi(DEV_IDX):
-        try:
-            # --------------------------------------------------
-            # 示例 1: 寄存器 写
-            # --------------------------------------------------
-            test_reg = 0x20
-            write_val = 0x80
-            
-            success, _ = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, data_val=write_val, is_read=False
-            )
-            if success:
-                print(f"[写寄存器成功] 地址 0x{test_reg:02X} <= 0x{write_val:02X}")
-
-            time.sleep(0.01) # 两次读写间适当间隔
-
-            # --------------------------------------------------
-            # 示例 1: 寄存器 写
-            # --------------------------------------------------
-            test_reg = 0x06
-            write_val = 0x7a
-            
-            success, _ = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, data_val=write_val, is_read=False
-            )
-            if success:
-                print(f"[写寄存器成功] 地址 0x{test_reg:02X} <= 0x{write_val:02X}")
-
-            time.sleep(0.01) # 两次读写间适当间隔
-
-            # --------------------------------------------------
-            # 示例 1: 寄存器 写
-            # --------------------------------------------------
-            test_reg = 0x5e
-            write_val = 0x80
-            
-            success, _ = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, data_val=write_val, is_read=False
-            )
-            if success:
-                print(f"[写寄存器成功] 地址 0x{test_reg:02X} <= 0x{write_val:02X}")
-
-            time.sleep(0.01) # 两次读写间适当间隔
-
-            # --------------------------------------------------
-            # 示例 1: 寄存器 写
-            # --------------------------------------------------
-            test_reg = 0x04
-            write_val = 0xc2
-            
-            success, _ = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, data_val=write_val, is_read=False
-            )
-            if success:
-                print(f"[写寄存器成功] 地址 0x{test_reg:02X} <= 0x{write_val:02X}")
-
-            time.sleep(0.01) # 两次读写间适当间隔
-
-            # --------------------------------------------------
-            # 示例 2: 寄存器 读
-            # --------------------------------------------------
-            test_reg = 0x04
-            success, read_val = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, is_read=True
-            )
-            if success:
-                print(f"[读寄存器成功] 地址 0x{test_reg:02X} => 0x{read_val:02X}")
-
-            # --------------------------------------------------
-            # 示例 2: 寄存器 读
-            # --------------------------------------------------
-            test_reg = 0x1a
-            success, read_val = transceiver_transfer_8bit_one_shot(
-                DEV_IDX, reg_addr=test_reg, is_read=True
-            )
-            if success:
-                print(f"[读寄存器成功] 地址 0x{test_reg:02X} => 0x{read_val:02X}")
-
-        finally:
-            # 关闭设备
-            ch347.CH347CloseDevice(DEV_IDX)
-            print("设备已关闭。")
+    raise SystemExit(main())
