@@ -1,5 +1,6 @@
 import ctypes
 import argparse
+import re
 import shlex
 import time
 from ctypes import (
@@ -427,6 +428,21 @@ class ProximaSPI:
     ) -> int:
         return self.write_reg(addr, value, width=32)
 
+    def set_bits(self, addr: int, high: int, low: int, value: int) -> int:
+        """Read a 32-bit register, replace the selected field, and write back."""
+        if not (0 <= addr <= 0xFFFF):
+            raise ValueError("address must be a 16-bit value")
+        _validate_bit_field(high, low, value)
+        mask = ((1 << (high - low + 1)) - 1) << low
+        old_value = self.read_reg32(addr)
+        new_value = (old_value & ~mask) | (value << low)
+        print(
+            f"SETBITS addr=0x{addr:04X} bits=[{high}:{low}] "
+            f"value=0x{value:X} old=0x{old_value:08X} new=0x{new_value:08X}"
+        )
+        self.write_reg32(addr, new_value)
+        return new_value
+
     def read_reg32(
         self,
         addr: int
@@ -456,6 +472,14 @@ def _parse_integer(token: str, description: str) -> int:
         ) from exc
 
 
+def _validate_bit_field(high: int, low: int, value: int) -> None:
+    if not (0 <= low <= high <= 31):
+        raise ValueError("bit range must satisfy 0 <= low <= high <= 31")
+    width = high - low + 1
+    if not (0 <= value < (1 << width)):
+        raise ValueError(f"value must fit in {width} bits")
+
+
 def load_commands(command_path) -> list:
     command_path = Path(command_path)
     commands = []
@@ -479,6 +503,27 @@ def load_commands(command_path) -> list:
             operation = fields[0].lower()
 
             try:
+                if operation == "setbits":
+                    if len(fields) != 4:
+                        raise ValueError(
+                            "setbits requires three arguments: "
+                            "setbits <address> [high:low] <value> (or [bit])"
+                        )
+                    addr = _parse_integer(fields[1], "address")
+                    if not (0 <= addr <= 0xFFFF):
+                        raise ValueError("address must be a 16-bit value")
+                    match = re.fullmatch(r"\[([0-9]+)(?::([0-9]+))?\]", fields[2])
+                    if match is None:
+                        raise ValueError("bit field must be [high:low] or [bit]")
+                    high = int(match.group(1))
+                    low = int(match.group(2)) if match.group(2) is not None else high
+                    value = _parse_integer(fields[3], "value")
+                    _validate_bit_field(high, low, value)
+                    commands.append(RegisterCommand(
+                        line_number, operation, (addr, high, low, value)
+                    ))
+                    continue
+
                 if operation == "delay":
                     if len(fields) != 2:
                         raise ValueError(
@@ -506,7 +551,7 @@ def load_commands(command_path) -> list:
                 ):
                     raise ValueError(
                         f"unknown operation {fields[0]!r}; "
-                        "expected r1-r4, w1-w4 or delay"
+                        "expected r1-r4, w1-w4, setbits or delay"
                     )
 
                 width = int(operation[1]) * 8
@@ -558,6 +603,8 @@ def execute_commands(dev, commands) -> None:
             milliseconds = command.arguments[0]
             print(f"DELAY   {milliseconds} ms")
             time.sleep(milliseconds / 1000.0)
+        elif command.operation == "setbits":
+            dev.set_bits(*command.arguments)
         elif command.operation.startswith("r"):
             dev.read_reg(*command.arguments)
         else:
