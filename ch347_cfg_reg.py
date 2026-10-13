@@ -443,6 +443,22 @@ class ProximaSPI:
         self.write_reg32(addr, new_value)
         return new_value
 
+    def set_bit_list(self, addr: int, bits: tuple, values: tuple) -> int:
+        """Replace discrete bits with one 32-bit read and one write."""
+        if not (0 <= addr <= 0xFFFF):
+            raise ValueError("address must be a 16-bit value")
+        _validate_bit_list(bits, values)
+        mask = sum(1 << bit for bit in bits)
+        field_value = sum(value << bit for bit, value in zip(bits, values))
+        old_value = self.read_reg32(addr)
+        new_value = (old_value & ~mask) | field_value
+        print(
+            f"SETBITS addr=0x{addr:04X} bits={bits} values={values} "
+            f"old=0x{old_value:08X} new=0x{new_value:08X}"
+        )
+        self.write_reg32(addr, new_value)
+        return new_value
+
     def read_reg32(
         self,
         addr: int
@@ -480,6 +496,17 @@ def _validate_bit_field(high: int, low: int, value: int) -> None:
         raise ValueError(f"value must fit in {width} bits")
 
 
+def _validate_bit_list(bits: tuple, values: tuple) -> None:
+    if not bits or len(bits) != len(values):
+        raise ValueError("bit and value lists must be nonempty and have equal lengths")
+    if any(not (0 <= bit <= 31) for bit in bits):
+        raise ValueError("bit numbers must be between 0 and 31")
+    if len(set(bits)) != len(bits):
+        raise ValueError("duplicate bit numbers are not allowed")
+    if any(value not in (0, 1) for value in values):
+        raise ValueError("each bit value must be 0 or 1")
+
+
 def load_commands(command_path) -> list:
     command_path = Path(command_path)
     commands = []
@@ -504,10 +531,31 @@ def load_commands(command_path) -> list:
 
             try:
                 if operation == "setbits":
+                    # Rejoin tokens so whitespace inside lists is accepted.
+                    list_match = re.fullmatch(
+                        r"(\S+)\s+\[\s*([0-9]+(?:\s*,\s*[0-9]+)*)\s*\]"
+                        r"\s+\(\s*([^()]*)\s*\)",
+                        " ".join(fields[1:])
+                    )
+                    if list_match is not None:
+                        addr = _parse_integer(list_match.group(1), "address")
+                        if not (0 <= addr <= 0xFFFF):
+                            raise ValueError("address must be a 16-bit value")
+                        bits = tuple(int(bit.strip()) for bit in list_match.group(2).split(","))
+                        values = tuple(
+                            _parse_integer(value.strip(), "bit value")
+                            for value in list_match.group(3).split(",")
+                        )
+                        _validate_bit_list(bits, values)
+                        commands.append(RegisterCommand(
+                            line_number, operation, (addr, bits, values)
+                        ))
+                        continue
                     if len(fields) != 4:
                         raise ValueError(
                             "setbits requires three arguments: "
-                            "setbits <address> [high:low] <value> (or [bit])"
+                            "setbits <address> [high:low] <value> (or [bit]), "
+                            "or setbits <address> [bit,...] (value,...)"
                         )
                     addr = _parse_integer(fields[1], "address")
                     if not (0 <= addr <= 0xFFFF):
@@ -604,7 +652,10 @@ def execute_commands(dev, commands) -> None:
             print(f"DELAY   {milliseconds} ms")
             time.sleep(milliseconds / 1000.0)
         elif command.operation == "setbits":
-            dev.set_bits(*command.arguments)
+            if len(command.arguments) == 3:
+                dev.set_bit_list(*command.arguments)
+            else:
+                dev.set_bits(*command.arguments)
         elif command.operation.startswith("r"):
             dev.read_reg(*command.arguments)
         else:
