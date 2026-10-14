@@ -530,6 +530,28 @@ def load_commands(command_path) -> list:
             operation = fields[0].lower()
 
             try:
+                if operation == "check":
+                    if len(fields) not in (3, 4, 5):
+                        raise ValueError(
+                            "check requires: check <address> <value> [width] [mask]"
+                        )
+                    addr = _parse_integer(fields[1], "address")
+                    value = _parse_integer(fields[2], "expected value")
+                    width = _parse_integer(fields[3], "width") if len(fields) >= 4 else 32
+                    if not (0 <= addr <= 0xFFFF):
+                        raise ValueError("address must be a 16-bit value")
+                    if width not in (8, 16, 24, 32):
+                        raise ValueError("width must be 8, 16, 24 or 32")
+                    if not (0 <= value < (1 << width)):
+                        raise ValueError(f"expected value must fit in {width} bits")
+                    mask = _parse_integer(fields[4], "mask") if len(fields) == 5 else (1 << width) - 1
+                    if not (0 < mask < (1 << width)):
+                        raise ValueError(f"mask must be nonzero and fit in {width} bits")
+                    commands.append(RegisterCommand(
+                        line_number, operation, (addr, value, width, mask)
+                    ))
+                    continue
+
                 if operation == "setbits":
                     # Rejoin tokens so whitespace inside lists is accepted.
                     list_match = re.fullmatch(
@@ -599,7 +621,7 @@ def load_commands(command_path) -> list:
                 ):
                     raise ValueError(
                         f"unknown operation {fields[0]!r}; "
-                        "expected r1-r4, w1-w4, setbits or delay"
+                        "expected r1-r4, w1-w4, check, setbits or delay"
                     )
 
                 width = int(operation[1]) * 8
@@ -651,6 +673,17 @@ def execute_commands(dev, commands) -> None:
             milliseconds = command.arguments[0]
             print(f"DELAY   {milliseconds} ms")
             time.sleep(milliseconds / 1000.0)
+        elif command.operation == "check":
+            addr, expected, width, mask = command.arguments
+            actual = dev.read_reg(addr, width)
+            detail = (
+                f"line {command.line_number}: addr=0x{addr:04X} "
+                f"expected=0x{expected:08X} actual=0x{actual:08X} "
+                f"mask=0x{mask:08X}"
+            )
+            if (actual & mask) != (expected & mask):
+                raise RuntimeError(f"TEST FAILED: {detail}")
+            print(f"CHECK PASS: {detail}")
         elif command.operation == "setbits":
             if len(command.arguments) == 3:
                 dev.set_bit_list(*command.arguments)
@@ -702,6 +735,11 @@ def main() -> None:
 
     try:
         execute_commands(dev, commands)
+        if any(command.operation == "check" for command in commands):
+            print("TEST PASSED: all register checks passed")
+    except RuntimeError as exc:
+        print(f"TEST FAILED: {exc}" if not str(exc).startswith("TEST FAILED:") else str(exc))
+        raise SystemExit(1) from exc
     finally:
         dev.close()
 
