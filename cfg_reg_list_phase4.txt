@@ -1,0 +1,59 @@
+# Proxima Phase 4: Check and Trim HSI Clock、16MHz Clock and the voltages
+############# clk/trim cfg #############
+r4 0x1020
+#Enable 16M
+w4 0x1020 0x198401 
+r4 0x1020
+
+r4 0x100C
+#trim VCORE and VDIG
+w4 0x100C 0x8504F17 
+r4 0x100C
+
+############## phase 4.5 #############
+#setbits 0x307c [4] 1
+#r4 0x307c
+##setbits 0x307c [4] 0
+
+############## phase 4.6 #############
+#setbits 0x307c [8] 1
+#r4 0x307c
+##setbits 0x307c [8] 0
+
+############### phase 4.7.1 #############
+#setbits 0x307c [5] 1
+#r4 0x307c
+#setbits 0x307c [7:6] 0
+#r4 0x307c
+
+############### phase 4.7.2 #############
+#setbits 0x307c [5] 1
+#r4 0x307c
+#setbits 0x307c [6] 1
+#r4 0x307c
+
+############### phase 4.7.3 #############
+#setbits 0x307c [5] 1
+#r4 0x307c
+#setbits 0x307c [7] 1
+#r4 0x307c
+
+############### phase 4.7.4 #############
+#setbits 0x307c [5] 1
+#r4 0x307c
+#setbits 0x307c [7:6] 3
+#r4 0x307c
+
+############# diag port cfg #############
+#setbits 0x3004 [0] 1
+#setbits 0x1018 [31] 0
+#setbits 0x1018 [3] 1
+
+
+############## set setbits #############
+#r4 0x307c
+#setbits 0x307c [1,3,7,6,8] (1,0,1,1,0)
+#r4 0x307c
+#
+#setbits 0x307c [1,7,6] (0,0,0)
+#r4 0x307c
