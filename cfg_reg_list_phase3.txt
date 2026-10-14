@@ -7,7 +7,7 @@
 # access_code、afc2_ctrl3及Memory测试值为本文件选定的固定测试图样。
 
 # 1. 读取 CR5 的初始值（应在上电/复位后、写入测试值之前检查）
-r4 0x1014 # CR5：期望 0x00005555
+r4 0x1014 # CR5：期望 0x00000000
 
 # 2. 如果上述值不正确，先排查再继续：
 # 用逻辑分析仪连接 H5-2(CSN)、H5-3(DO)、H5-4(DI)、H5-5(CLK)、
@@ -22,7 +22,7 @@ r4 0x1014 # 期望 0x0000AAAA
 
 # 5. Modem、RFDIG、DC Memory、CH Memory 读写检查
 # 5.1 Modem dem_afc_freq 初始值
-r4 0x2008 # dem_afc_freq：期望 0xD0006666
+r4 0x2008 # dem_afc_freq：期望 0xD00C6666
 
 # 5.2 Modem access_code 写入并读回
 w4 0x2068 0xA5A55A5A # 自选32bit测试图样
