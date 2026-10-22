@@ -49,6 +49,7 @@ CW_INIT = (
     (0x35, 0x40), (0x37, 0x00), (0x50, 0xF8), (0x01, 0xF9),
     (0x46, 0x80), (0x44, 0xB0), (0x16, 0x83),
 )
+
 BIT_REVERSE = bytes(int(f"{value:08b}"[::-1], 2) for value in range(256))
 FIFO_SIZE = 63
 FIFO_FULL_THRESHOLD = 33
@@ -231,14 +232,29 @@ class WL1606:
     def set_power(self, level):
         self.write(0x12, POWER_TABLE[level - 1][0])
 
+    # CW模式即direct mode，其频点设置与正常模式不同，频率范围为2402~2480MHz
+    # 见<WL1606A Engineering Spec.241123.pdf>的12.8.1
+    def set_cw_freq(self, channel):
+        # 根据传入信道，计算Reg14和Reg15的配置
+        if not 2 <= channel <= 80:
+            raise ValueError("CW channel must be between 2 ~ 80")
+
+        self.read(0x0F)
+        self.write(0x0F, 0x4c)
+        self.read(0x0E)
+        self.write(0x0E, 0x00)
+        self.sleep(0.001)
+        
+        reg_14 = (channel % 32) * 2
+        reg_15 = 0x4B + (channel // 32)
+        self.write(0x0F, reg_15)
+        self.write(0x0E, reg_14 | 0x01)
+
     def init_cw(self, channel, power):
-        self.write_sequence(CW_INIT)
-        self.update(0x0F, clear=0x80)
-        self.update(0x0E, clear=0x01)
-        # Trace's 0x4B is a channel example, not a fixed CW control value.
-        self.write(0x0F, channel)
-        self.set_power(power)
-        self.write(0x0E, 0x05)
+            self.write_sequence(CW_INIT) 
+            self.set_power(power)
+            self.set_cw_freq(channel)
+            
 
     def init_packet(self, length, channel, power):
         self.write(0x20, 0x80)
