@@ -98,12 +98,15 @@ class CH347SPI:
         cfg.mMode = 1
         cfg.mClock = 5  # CH347 clock. 2: 60 MHz / 2**2 = 15 MHz
         cfg.mByteOrder = 1
-        cfg.mSPIWriteReadInterval = 0 #2
+        # 0：transfer_fifo时，每个tx_data之间连续发送，无间隔； 
+        # 1：transfer_fifo时，每个tx_data之间间隔257us发送； 
+        # 2：transfer_fifo时，每个tx_data之间间隔513us发送；
+        cfg.mSPIWriteReadInterval = 0
         cfg.mSpiOutDefaultData = 0x00
         cfg.mChipSelect = 0x80
         cfg.mIsAutoDeactiveCS = 1
 
-        # JXX: add
+        # # JXX: add
         # cfg.mActiveDelayNum = 0
         # cfg.mDelayNum = 0
         try:
@@ -278,9 +281,11 @@ class WL1606:
         #self.update(0x25, set_bits=0x03)
         self.update(0x0F, clear=0x80)
         self.update(0x0E, clear=0x01)
+        # Note: 实际两条spi cmd+data之间存在200us左右的间隔，
+        # 所以这里不加sleep也可以，不过为了避免太过极限，还是加上
         self.sleep(0.000010)
         self.update(0x0E, set_bits=0x01)
-        deadline = time.monotonic() + timeout_ms / 1000.0
+        #deadline = time.monotonic() + timeout_ms / 1000.0
         # while True:
         #     flag = self.read(0x61)
         #     if flag & PKT_FLAG:
@@ -390,7 +395,11 @@ def main(argv=None):
                 if args.dry_run and count >= limit:
                     break
                 if args.tx_cnt == 0xFFFF or count < limit:
-                    radio.sleep(args.tx_interval / 1000.0)
+                    if args.tx_interval:
+                        radio.sleep(args.tx_interval / 1000.0)
+                    else:
+                        # 如果设置的interval为0，也要手动加入100us的延时（实际测会延时700us左右），否则发送的空口数据包会有误码
+                        radio.sleep(0.0001)
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，停止发送。")
     except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
