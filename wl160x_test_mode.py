@@ -98,10 +98,14 @@ class CH347SPI:
         cfg.mMode = 1
         cfg.mClock = 5  # CH347 clock. 2: 60 MHz / 2**2 = 15 MHz
         cfg.mByteOrder = 1
-        cfg.mSPIWriteReadInterval = 2
+        cfg.mSPIWriteReadInterval = 0 #2
         cfg.mSpiOutDefaultData = 0x00
         cfg.mChipSelect = 0x80
         cfg.mIsAutoDeactiveCS = 1
+
+        # JXX: add
+        # cfg.mActiveDelayNum = 0
+        # cfg.mDelayNum = 0
         try:
             if not self.dll.CH347SPI_Init(self.index, ctypes.byref(cfg)):
                 raise RuntimeError("CH347SPI_Init 失败")
@@ -132,6 +136,30 @@ class CH347SPI:
             if not self.dll.CH347CloseDevice(self.index):
                 raise RuntimeError("CH347CloseDevice 失败")
 
+    def transfer_fifo(self, data):
+        """Write FIFO per WL1606A manual Fig.7: one 0x64 then N bytes.
+
+        Keep CS active for the entire WriteRead call. This interface sends
+        the supplied wire bytes unchanged; payload bit reversal is done by
+        send_packet. An empty payload does not generate an SPI transaction.
+        The caller is responsible for the available FIFO capacity.
+        """
+        if not self.opened:
+            raise RuntimeError("CH347 尚未打开")
+        data = bytes(data)
+        if not data:
+            return 0
+        buf = (c_ubyte * (len(data) + 1))(0x64, *data)
+        if not self.dll.CH347SPI_ChangeCS(self.index, 0):
+            raise RuntimeError("CH347 拉低 CS 失败")
+        try:
+            success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
+        finally:
+            released = self.dll.CH347SPI_ChangeCS(self.index, 1)
+        if not success or not released:
+            raise RuntimeError(f"SPI FIFO 连续写入失败 ({len(data)} 字节)")
+        return len(data)
+
 
 class DryRunSPI:
     """No DLL/device access; flags emulate immediate progress, not real timing."""
@@ -161,6 +189,11 @@ class DryRunSPI:
     def close(self):
         pass
 
+    def transfer_fifo(self, data):
+        data = bytes(data)
+        self.fifo.extend(data)
+        return len(data)
+
 
 class WL1606:
     def __init__(self, spi, verbose=False, sleep=time.sleep):
@@ -183,6 +216,14 @@ class WL1606:
     def write_sequence(self, sequence):
         for address, value in sequence:
             self.write(address, value)
+
+    def transfer_fifo(self, data):
+        """Write one contiguous FIFO block; log one line per CS transaction."""
+        data = bytes(data)
+        count = self.spi.transfer_fifo(data)
+        if self.verbose and data:
+            print(f"write_fifo=64 {data.hex(' ').upper()} ({count} bytes)")
+        return count
 
     def set_power(self, level):
         self.write(0x12, POWER_TABLE[level - 1][0])
@@ -232,8 +273,7 @@ class WL1606:
         # For long packets, the unmodified length byte consumes one FIFO slot.
         stream = bytes([len(payload)]) + wire_payload if len(payload) > FIFO_SIZE else wire_payload
         sent = min(len(stream), FIFO_SIZE)
-        for value in stream[:sent]:
-            self.write(0x64, value)
+        self.transfer_fifo(stream[:sent])
         # Clear stale packet/FIFO IRQ before a new TX trigger.
         #self.update(0x25, set_bits=0x03)
         self.update(0x0F, clear=0x80)
@@ -250,8 +290,7 @@ class WL1606:
         #         raise RuntimeError(f"TX 提前结束/疑似 FIFO 欠载: 已装载 {sent}/{len(stream)} 字节")
         #     if flag & FIFO_FLAG:
         #         end = min(sent + FIFO_SIZE - FIFO_FULL_THRESHOLD, len(stream))
-        #         for value in stream[sent:end]:
-        #             self.write(0x64, value)
+        #         self.transfer_fifo(stream[sent:end])
         #         sent = end
         #         self.update(0x25, set_bits=0x01)
         #     if time.monotonic() >= deadline:
