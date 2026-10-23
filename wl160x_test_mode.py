@@ -28,7 +28,7 @@ import sys
 import time
 from ctypes import POINTER, Structure, c_bool, c_ubyte, c_ulong, c_ushort
 from pathlib import Path
-
+import re
 
 # Descending output power, exactly as shown in the supplied mapping image.
 POWER_TABLE = (
@@ -49,6 +49,15 @@ CW_INIT = (
     (0x35, 0x40), (0x37, 0x00), (0x50, 0xF8), (0x01, 0xF9),
     (0x46, 0x80), (0x44, 0xB0), (0x16, 0x83),
 )
+
+SPI_CLK_MHz = {0:"60MHz", 
+               1:"30MHz", 
+               2:"15MHz", 
+               3:"7.5MHz", 
+               4:"3.75MHz", 
+               5:"1.875MHz", 
+               6:"937.5kHz", 
+               7:"468.75kHz"}
 
 BIT_REVERSE = bytes(int(f"{value:08b}"[::-1], 2) for value in range(256))
 FIFO_SIZE = 63
@@ -110,13 +119,16 @@ class CH347SPI:
         # # JXX: add
         # cfg.mActiveDelayNum = 0
         # cfg.mDelayNum = 0
+
+        self.spi_clk = float(re.search(r"[+-]?\d*\.?\d+", SPI_CLK_MHz[cfg.mClock]).group())
+        
         try:
             if not self.dll.CH347SPI_Init(self.index, ctypes.byref(cfg)):
                 raise RuntimeError("CH347SPI_Init 失败")
         except BaseException:
             self.close()
             raise
-        print("CH347 SPI: Mode 1, MSB first, 15 MHz, 字节间隔 2 us, CS0")
+        print(f"CH347 SPI: Mode 1, SPI CLK: {SPI_CLK_MHz[cfg.mClock]}, MSB first, CS0")
 
     def transfer(self, address, value=0, read=False):
         if not self.opened:
@@ -356,10 +368,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tx_len", type=integer, default=0x0A, help="payload 长度 0..255，默认 10")
     parser.add_argument("--tx_pkt_type", type=packet_type, default="0xff", help="默认全 1；random 每包重新生成")
-    parser.add_argument("--tx_cnt", type=integer, default=0xFFFF, help="1..65534 次；65535=持续发送")
+    parser.add_argument("--tx_cnt", type=integer, default=0xFFFF, help="1..65534 次；65535=持续发送；默认：0xFFFF")
     parser.add_argument("--tx_interval", type=float, default=20, help="两包之间 sleep 毫秒，默认 20")
     parser.add_argument("--tx_pwr", type=integer, default=1, help="1..15，默认 1 (8 dBm，最大)")
-    parser.add_argument("--tx_chan", type=integer, default=40, help="0..80，频率=2400+chan MHz")
+    parser.add_argument("--tx_chan", type=integer, default=40, help="0..80，频率=2400+chan MHz，默认40")
     parser.add_argument("--tx_test_mode", type=integer, default=1, help="0=CW，1=packet (默认)")
     parser.add_argument("--dev_index", type=integer, default=0, help="CH347 设备索引，默认 0")
     parser.add_argument("--dll", help="CH347DLLA64.dll 路径，默认脚本同目录")
@@ -399,7 +411,9 @@ def main(argv=None):
             print(f"payload={args.tx_len} 字节, 类型={args.tx_pkt_type}, "
                   f"包数={'持续' if args.tx_cnt == 0xFFFF else args.tx_cnt}, 间隔={args.tx_interval:g} ms")
             if args.tx_len > FIFO_SIZE:
-                print("注意：当前 SPI 时钟为 15 MHz；长包仍需实时补充 FIFO，Python 调用开销及 2 us 字节间隔可能导致欠载，需实测。")
+                print(f"注意：当前 SPI 时钟为 {spi.spi_clk} MHz；长包仍需实时补充 FIFO，Python 调用开销及 2 us 字节间隔可能导致欠载，需实测。")
+                while True:
+                    pass
             radio.init_packet(args.tx_len, args.tx_chan, args.tx_pwr)
             limit = 1 if args.dry_run and args.tx_cnt == 0xFFFF else args.tx_cnt
             count = 0
