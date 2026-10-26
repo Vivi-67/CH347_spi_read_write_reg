@@ -1,8 +1,9 @@
-"""WL1606 CW/packet TX test through CH347 (Python 3, Windows x64).
+"""WL1606 CW/packet TX and short-packet RX test through CH347.
 
 Examples::
-    python wl160x_test_mode.py --tx_test_mode 0 --tx_chan 40 --tx_pwr 1
-    python wl160x_test_mode.py --tx_len 0x20 --tx_pkt_type 0x55 --tx_cnt 100 --tx_interval 20 --tx_pwr 1 --tx_chan 30 --tx_test_mode 1
+    python wl160x_test_mode.py --tx_test_mode 0 --chan 40 --tx_pwr 1
+    python wl160x_test_mode.py --len 20 --pkt_type 0x55 --tx_cnt 100
+    python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000
     python wl160x_test_mode.py --dry-run --tx_cnt 2 --verbose
 
 References: source/Dri_Wl1606.c (Init/TxLoop), both WL1606 TX register
@@ -29,6 +30,7 @@ import time
 from ctypes import POINTER, Structure, c_bool, c_ubyte, c_ulong, c_ushort
 from pathlib import Path
 import re
+from datetime import datetime
 
 # Descending output power, exactly as shown in the supplied mapping image.
 POWER_TABLE = (
@@ -65,6 +67,7 @@ FIFO_FULL_THRESHOLD = 33
 FIFO_EMPTY_THRESHOLD = 13
 PKT_FLAG = 0x40
 FIFO_FLAG = 0x20
+RX_TIMEOUT_SECONDS = 1.0
 
 
 class SPI_CONFIG(Structure):
@@ -152,6 +155,25 @@ class CH347SPI:
             if not self.dll.CH347CloseDevice(self.index):
                 raise RuntimeError("CH347CloseDevice 失败")
 
+    def read_fifo(self, length):
+        """Read reg100 continuously under one CS (manual section 7, Fig.7)."""
+        if not self.opened:
+            raise RuntimeError("CH347 尚未打开")
+        if not 0 <= length <= FIFO_SIZE:
+            raise ValueError("RX FIFO 单次读取长度必须在 0..63 之间")
+        if not length:
+            return b""
+        buf = (c_ubyte * (length + 1))(0xE4, *([0xFF] * length))
+        if not self.dll.CH347SPI_ChangeCS(self.index, 0):
+            raise RuntimeError("CH347 拉低 CS 失败")
+        try:
+            success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
+        finally:
+            released = self.dll.CH347SPI_ChangeCS(self.index, 1)
+        if not success or not released:
+            raise RuntimeError(f"SPI FIFO 连续读取失败 ({length} 字节)")
+        return bytes(buf[1:])
+
     def transfer_fifo(self, data):
         """Write FIFO per WL1606A manual Fig.7: one 0x64 then N bytes.
 
@@ -183,13 +205,16 @@ class DryRunSPI:
         self.registers = {0x29: 0x10, 0x40: 0x88, 0x52: 0x90}
         self.fifo = []
         self.expected = 0
+        self.rx_mode = False
 
     def open(self):
-        print("[dry-run] 模拟寄存器及 TX 标志，不连接 CH347、不发射")
+        print("[dry-run] 模拟寄存器及标志，不连接 CH347；RX 默认无输入包")
 
     def transfer(self, address, value=0, read=False):
         if read:
             if address == 0x61:
+                if self.rx_mode:
+                    return 0
                 return PKT_FLAG if len(self.fifo) >= self.expected else FIFO_FLAG
             return self.registers.get(address, 0)
         self.registers[address] = value
@@ -197,13 +222,18 @@ class DryRunSPI:
             self.fifo = []
         elif address == 0x64:
             self.fifo.append(value)
-        elif address == 0x0E and value & 1 and not value & 4:
+        elif address == 0x0E and value & 1 and not value & 4 and not self.rx_mode:
             length_reg = self.registers.get(0x5F, 0)
             self.expected = (length_reg & 0x7F) if length_reg & 0x80 else self.fifo[0] + 1
         return value
 
     def close(self):
         pass
+
+    def read_fifo(self, length):
+        data = bytes(self.fifo[:length])
+        del self.fifo[:length]
+        return data
 
     def transfer_fifo(self, data):
         data = bytes(data)
@@ -268,7 +298,7 @@ class WL1606:
             self.set_cw_freq(channel)
             
 
-    def init_packet(self, length, channel, power):
+    def init_packet(self, length, channel, power=None):
         self.write(0x20, 0x80)
         self.sleep(0.010)
         self.write(0x06, 0x7A)
@@ -295,8 +325,45 @@ class WL1606:
         self.write(0x40, (self.read(0x40) & 0x03) | 0x88)
         self.write_sequence(((0x50, 0x68), (0x51, 0x44),
                              (0x0F, channel), (0x46, 0x03)))
-        self.set_power(power)
+        if power is not None:
+            self.set_power(power)
         self.update(0x68, set_bits=0x80)
+
+    def arm_rx(self):
+        # Clear RX_EN before toggling it, as in Wl16xx_RX_Mode. Clear the
+        # read pointer and stale IRQs before enabling reception again.
+        self.update(0x0F, clear=0x80)
+        self.update(0x0E, clear=0x01)
+        self.update(0x69, set_bits=0x80)
+        self.update(0x25, set_bits=0x03)
+        self.sleep(0.000010)
+        self.update(0x0F, set_bits=0x80)
+
+    def init_rx(self, length, channel):
+        # Same fixed-length, CRC-enabled, no-length-prefix wire format as
+        # the supplied RX sequence and the existing short-packet TX.
+        self.init_packet(length, channel)
+        self.arm_rx()
+
+    def receive_packet(self, expect_len):
+        """Return None while waiting, or (CRC error, decoded payload).
+
+        Check CRC before reading FIFO. Fixed-length mode has no length
+        prefix; read expect_len bytes supplied by --len, as in the C driver.
+        Every completed packet, including a bad one, rearms the receiver.
+        """
+        if not self.read(0x61) & PKT_FLAG:
+            return None
+        try:
+            crc_error = bool(self.read(0x60) & 0x80)
+            if crc_error:
+                return True, b""
+            wire_payload = self.spi.read_fifo(expect_len)
+            if self.verbose:
+                print(f"read_fifo=E4 {wire_payload.hex(' ').upper()} ({len(wire_payload)} bytes)")
+            return False, wire_payload.translate(BIT_REVERSE)
+        finally:
+            self.arm_rx()
 
     def send_packet(self, payload, timeout_ms):
         self.update(0x68, set_bits=0x80)
@@ -364,61 +431,139 @@ def make_payload(length, kind):
     return bytes([int(kind, 16)]) * length
 
 
+class RxStats:
+    def __init__(self, expected_payload):
+        self.expected_payload = expected_payload
+        self.rx_cnt = self.crc_err_cnt = self.invalid_pkt_cnt = 0
+
+    def record(self, crc_error, payload):
+        if crc_error:
+            self.crc_err_cnt += 1
+        elif payload != self.expected_payload:
+            self.invalid_pkt_cnt += 1
+        else:
+            self.rx_cnt += 1
+            #JXX
+            while True:
+                pass
+
+    def report(self):
+        print(f"Rx cnt: {self.rx_cnt}, Crc_err_cnt: {self.crc_err_cnt},  Invalid pkt cnt:{self.invalid_pkt_cnt}", flush=True)
+
+
+def run_rx(radio, args, clock=time.monotonic, sleep=time.sleep):
+    stats = RxStats(make_payload(args.len, args.pkt_type))
+    interval = args.out_rx_result_time / 1000.0
+    next_report = clock() + interval
+    receive_deadline = clock() + RX_TIMEOUT_SECONDS
+    if args.dry_run:
+        stats.report()
+        return stats
+
+    while True:
+        packet = radio.receive_packet(expect_len=args.len)
+        now = clock()
+        if packet is not None:
+            crc_error, payload = packet
+            if not crc_error:
+                # print(datetime.now().strftime("%H:%M:%S"))
+                print(f"time: {datetime.now()}, Rx data: {payload.hex(' ').upper()} ({len(payload)} bytes)", flush=True)
+            stats.record(*packet)
+            receive_deadline = now + RX_TIMEOUT_SECONDS
+        elif now >= receive_deadline:
+            # Manual 8.3: exit RX on timeout, then resume waiting. This
+            # recovery timer is independent of the statistics interval.
+            radio.arm_rx()
+            receive_deadline = clock() + RX_TIMEOUT_SECONDS
+        if now >= next_report:
+            stats.report()
+            next_report += (int((now - next_report) / interval) + 1) * interval
+        if packet is None:
+            sleep(min(0.0001, max(0.0, next_report - clock())))
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--tx_len", type=integer, default=0x0A, help="payload 长度 0..255，默认 10")
-    parser.add_argument("--tx_pkt_type", type=packet_type, default="0xff", help="默认全 1；random 每包重新生成")
-    parser.add_argument("--tx_cnt", type=integer, default=0xFFFF, help="1..65534 次；65535=持续发送；默认：0xFFFF")
-    parser.add_argument("--tx_interval", type=float, default=20, help="两包之间 sleep 毫秒，默认 20")
-    parser.add_argument("--tx_pwr", type=integer, default=1, help="1..15，默认 1 (8 dBm，最大)")
-    parser.add_argument("--tx_chan", type=integer, default=40, help="0..80，频率=2400+chan MHz，默认40")
-    parser.add_argument("--tx_test_mode", type=integer, default=1, help="0=CW，1=packet (默认)")
+    parser.add_argument("--mode", type=integer, choices=(0, 1), default=0, help="0=TX (默认)，1=RX")
+    parser.add_argument("--len", "--tx_len", dest="len", type=integer, default=20, help="payload 字节数，TX 0..255，RX 短包 1..63，默认 20")
+    parser.add_argument("--pkt_type", "--tx_pkt_type", dest="pkt_type", type=packet_type, default="0xff", help="默认全 1；random 仅限 TX")
+    parser.add_argument("--chan", "--tx_chan", dest="chan", type=integer, default=40, help="0..80，频率=2400+chan MHz，默认40")
+    parser.add_argument("--tx_cnt", default=0xFFFF, help="1..65534 次；65535=持续发送；默认：0xFFFF；仅 TX")
+    parser.add_argument("--tx_interval", default=20, help="两包之间 sleep 毫秒，默认 20；仅 TX")
+    parser.add_argument("--tx_pwr", default=1, help="1..15，默认 1 (8 dBm，最大)；仅 TX")
+    parser.add_argument("--tx_test_mode", default=1, help="0=CW，1=packet (默认)；仅 TX")
+    parser.add_argument("--out_rx_result_time", default=1000, help="RX 累计统计输出间隔，正毫秒数，默认 1000；仅 RX")
     parser.add_argument("--dev_index", type=integer, default=0, help="CH347 设备索引，默认 0")
     parser.add_argument("--dll", help="CH347DLLA64.dll 路径，默认脚本同目录")
-    parser.add_argument("--tx_timeout", type=float, default=1000, help="每包完成超时毫秒，默认 1000")
+    parser.add_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
     parser.add_argument("--verbose", action="store_true", help="打印每笔寄存器读写（会减慢长包补充 FIFO）")
-    parser.add_argument("--dry-run", action="store_true", help="模拟 SPI；无限次数时只模拟 1 包")
+    parser.add_argument("--dry-run", action="store_true", help="模拟 SPI；TX 无限次数时模拟 1 包；RX 输出一次零计数后退出")
     args = parser.parse_args(argv)
-    for name, low, high in (("tx_len", 0, 255), ("tx_cnt", 1, 65535), ("tx_pwr", 1, 15),
-                            ("tx_chan", 0, 80), ("tx_test_mode", 0, 1), ("dev_index", 0, 0xFFFFFFFF)):
+    # Convert/validate only parameters used by the selected direction.
+    active = {"out_rx_result_time": float} if args.mode else {
+        "tx_cnt": integer, "tx_pwr": integer, "tx_test_mode": integer,
+        "tx_interval": float, "tx_timeout": float,
+    }
+    for name, convert in active.items():
+        try:
+            setattr(args, name, convert(str(getattr(args, name))))
+        except (ValueError, argparse.ArgumentTypeError) as exc:
+            parser.error(f"--{name}: {exc}")
+    ranges = [("len", 1 if args.mode else 0, FIFO_SIZE if args.mode else 255),
+              ("chan", 0, 80), ("dev_index", 0, 0xFFFFFFFF)]
+    if not args.mode:
+        ranges.extend((("tx_cnt", 1, 65535), ("tx_pwr", 1, 15), ("tx_test_mode", 0, 1)))
+    for name, low, high in ranges:
         if not low <= getattr(args, name) <= high:
             parser.error(f"--{name} 必须在 {low}..{high} 之间")
-    if not math.isfinite(args.tx_interval) or args.tx_interval < 0:
+    if args.mode and args.pkt_type == "random":
+        parser.error("RX mode 的 --pkt_type 不支持 random；请选择固定数据类型，例如 0xff 或 0x55")
+    if args.mode and (not math.isfinite(args.out_rx_result_time) or args.out_rx_result_time <= 0):
+        parser.error("--out_rx_result_time 必须是有限的正毫秒数")
+    if not args.mode and (not math.isfinite(args.tx_interval) or args.tx_interval < 0):
         parser.error("--tx_interval 必须是有限的非负毫秒数")
-    if not math.isfinite(args.tx_timeout) or args.tx_timeout <= 0:
+    if not args.mode and (not math.isfinite(args.tx_timeout) or args.tx_timeout <= 0):
         parser.error("--tx_timeout 必须是有限的正毫秒数")
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
-    reg, dbm = POWER_TABLE[args.tx_pwr - 1]
-    print(f"模式={'CW' if args.tx_test_mode == 0 else 'packet'}, 频率={2400 + args.tx_chan} MHz, "
-          f"功率档={args.tx_pwr} (约 {dbm:g} dBm, reg12=0x{reg:02X})")
+    if args.mode:
+        print(f"模式=RX, 频率={2400 + args.chan} MHz, 预期 payload={args.len} 字节, "
+              f"类型={args.pkt_type}, 统计间隔={args.out_rx_result_time:g} ms")
+    else:
+        reg, dbm = POWER_TABLE[args.tx_pwr - 1]
+        print(f"模式=TX {'CW' if args.tx_test_mode == 0 else 'packet'}, 频率={2400 + args.chan} MHz, "
+              f"功率档={args.tx_pwr} (约 {dbm:g} dBm, reg12=0x{reg:02X})")
     spi = DryRunSPI() if args.dry_run else CH347SPI(args.dev_index, args.dll)
+    if args.dry_run:
+        spi.rx_mode = bool(args.mode)
     radio = WL1606(spi, args.verbose, (lambda seconds: None) if args.dry_run else time.sleep)
     opened = False
     result = 0
     try:
         spi.open()
         opened = True
-        if args.tx_test_mode == 0:
-            radio.init_cw(args.tx_chan, args.tx_pwr)
+        if args.mode:
+            radio.init_rx(args.len, args.chan)
+            print("接收已开启，Ctrl+C 停止；以下三项均为本次运行的累计计数。")
+            run_rx(radio, args)
+        elif args.tx_test_mode == 0:
+            radio.init_cw(args.chan, args.tx_pwr)
             print("单载波已开启，Ctrl+C 停止；CW 模式不使用包长、包型、包数和包间隔。")
             while not args.dry_run:
                 time.sleep(0.2)
         else:
-            print(f"payload={args.tx_len} 字节, 类型={args.tx_pkt_type}, "
+            print(f"payload={args.len} 字节, 类型={args.pkt_type}, "
                   f"包数={'持续' if args.tx_cnt == 0xFFFF else args.tx_cnt}, 间隔={args.tx_interval:g} ms")
-            if args.tx_len > FIFO_SIZE:
-                print(f"注意：当前 SPI 时钟为 {spi.spi_clk} MHz；长包仍需实时补充 FIFO，Python 调用开销及 2 us 字节间隔可能导致欠载，需实测。")
-                while True:
-                    pass
-            radio.init_packet(args.tx_len, args.tx_chan, args.tx_pwr)
+            if args.len > FIFO_SIZE:
+                print("注意：当前 TX 长包补充 FIFO 未启用，超过 63 字节不能完成完整发送。")
+            radio.init_packet(args.len, args.chan, args.tx_pwr)
             limit = 1 if args.dry_run and args.tx_cnt == 0xFFFF else args.tx_cnt
             count = 0
             while args.tx_cnt == 0xFFFF or count < limit:
-                radio.send_packet(make_payload(args.tx_len, args.tx_pkt_type), args.tx_timeout)
+                radio.send_packet(make_payload(args.len, args.pkt_type), args.tx_timeout)
                 count += 1
                 if args.verbose or count == 1 or count % 100 == 0 or count == limit:
                     print(f"{'模拟发送' if args.dry_run else '发送完成'}: {count} 包")
@@ -431,7 +576,7 @@ def main(argv=None):
                         # 如果设置的interval为0，也要手动加入100us的延时（实际测会延时700us左右），否则发送的空口数据包会有误码
                         radio.sleep(0.0001)
     except KeyboardInterrupt:
-        print("\n收到 Ctrl+C，停止发送。")
+        print("\n收到 Ctrl+C，停止接收。" if args.mode else "\n收到 Ctrl+C，停止发送。")
     except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         result = 1
