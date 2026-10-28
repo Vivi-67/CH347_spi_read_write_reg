@@ -71,7 +71,8 @@ RX_TIMEOUT_SECONDS = 1.0
 
 
 class SPI_CONFIG(Structure):
-    # Same ABI/layout as the working wl160x_cfg_reg_ok.py, no packing override.
+    # WCH CH347DLL.H declares SPI_CONFIG inside #pragma pack(1).
+    _pack_ = 1
     _fields_ = [
         ("mMode", c_ubyte), ("mClock", c_ubyte), ("mByteOrder", c_ubyte),
         ("mSPIWriteReadInterval", c_ushort), ("mSpiOutDefaultData", c_ubyte),
@@ -82,7 +83,15 @@ class SPI_CONFIG(Structure):
 
 
 class CH347SPI:
-    def __init__(self, index=0, dll_path=None):
+    def __init__(self, index=0, dll_path=None, fifo_read_style="single",
+                cs_setup_us=0, cs_hold_us=0):
+        if fifo_read_style not in ("single", "burst"):
+            raise ValueError("fifo_read_style must be single or burst")
+        if not 0 <= cs_setup_us <= 65535 or not 0 <= cs_hold_us <= 0xFFFFFFFF:
+            raise ValueError("CS delay out of range")
+        self.cs_setup_us = cs_setup_us
+        self.cs_hold_us = cs_hold_us
+        self.fifo_read_style = fifo_read_style
         self.index = index
         self.opened = False
         self.dll_path = Path(dll_path) if dll_path else Path(__file__).with_name("CH347DLLA64.dll")
@@ -109,19 +118,18 @@ class CH347SPI:
         self.opened = True
         cfg = SPI_CONFIG()
         cfg.mMode = 1
-        cfg.mClock = 5  # CH347 clock. 2: 60 MHz / 2**2 = 15 MHz
+        cfg.mClock = 7  # CH347 clock. 2: 60 MHz / 2**2 = 15 MHz
         cfg.mByteOrder = 1
-        # 0：transfer_fifo时，每个tx_data之间连续发送，无间隔； 
-        # 1：transfer_fifo时，每个tx_data之间间隔257us发送； 
-        # 2：transfer_fifo时，每个tx_data之间间隔513us发送；
-        cfg.mSPIWriteReadInterval = 0 #0
+        # Hardware interval in us; correct packed ABI is required.
+        cfg.mSPIWriteReadInterval = 0
         cfg.mSpiOutDefaultData = 0x00
         cfg.mChipSelect = 0x80
         cfg.mIsAutoDeactiveCS = 1
 
-        # # # JXX: add
-        # cfg.mActiveDelayNum = 3
-        # cfg.mDelayNum = 3
+        # Device-side delays, not Python sleeps. Zero requests minimum latency.
+        # 实测无影响
+        cfg.mActiveDelayNum = self.cs_setup_us
+        cfg.mDelayNum = self.cs_hold_us
 
         self.spi_clk = float(re.search(r"[+-]?\d*\.?\d+", SPI_CLK_MHz[cfg.mClock]).group())
         
@@ -131,7 +139,21 @@ class CH347SPI:
         except BaseException:
             self.close()
             raise
-        print(f"CH347 SPI: Mode 1, SPI CLK: {SPI_CLK_MHz[cfg.mClock]}, MSB first, CS0")
+        print(f"CH347 SPI: Mode 1, SPI CLK: {SPI_CLK_MHz[cfg.mClock]}, MSB first, CS0; "
+              f"auto CS, setup={self.cs_setup_us} us, hold={self.cs_hold_us} us")
+
+    def _exchange(self, buf, operation):
+        """One device-managed CS pulse per call, without separate USB CS commands."""
+        try:
+            if not self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf):
+                raise RuntimeError(f"{operation} 失败")
+        except BaseException:
+            # Normal transfers auto-release CS. Only attempt recovery on failure.
+            try:
+                self.dll.CH347SPI_ChangeCS(self.index, 1)
+            except Exception:
+                pass
+            raise
 
     def transfer(self, address, value=0, read=False):
         if not self.opened:
@@ -139,14 +161,7 @@ class CH347SPI:
         if not 0 <= address <= 0x7F or not 0 <= value <= 0xFF:
             raise ValueError("寄存器地址/数据越界")
         buf = (c_ubyte * 2)(address | (0x80 if read else 0), 0xFF if read else value)
-        if not self.dll.CH347SPI_ChangeCS(self.index, 0):
-            raise RuntimeError("CH347 拉低 CS 失败")
-        try:
-            success = self.dll.CH347SPI_WriteRead(self.index, 0x80, 2, buf)
-        finally:
-            released = self.dll.CH347SPI_ChangeCS(self.index, 1)
-        if not success or not released:
-            raise RuntimeError(f"SPI {'read' if read else 'write'} 0x{address:02X} 失败")
+        self._exchange(buf, f"SPI {'read' if read else 'write'} 0x{address:02X}")
         return int(buf[1]) if read else value
 
     def close(self):
@@ -156,49 +171,23 @@ class CH347SPI:
                 raise RuntimeError("CH347CloseDevice 失败")
 
     def read_fifo(self, length):
-        """Read reg100 continuously under one CS (manual section 7, Fig.7)."""
+        """Match MCU reg100 reads: one E4 + one byte per CS assertion.
+
+        This changes framing only. SPI4 WriteRead does not release MOSI
+        for a true three-wire SDIO turnaround; check board wiring.
+        """
         if not self.opened:
             raise RuntimeError("CH347 尚未打开")
         if not 0 <= length <= FIFO_SIZE:
             raise ValueError("RX FIFO 单次读取长度必须在 0..63 之间")
         if not length:
             return b""
+        if self.fifo_read_style == "single":
+            return bytes(self.transfer(0x64, read=True) for _ in range(length))
+        # Optional legacy burst mode for comparison captures.
         buf = (c_ubyte * (length + 1))(0xE4, *([0xFF] * length))
-        if not self.dll.CH347SPI_ChangeCS(self.index, 0):
-            raise RuntimeError("CH347 拉低 CS 失败")
-        try:
-            success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
-        finally:
-            released = self.dll.CH347SPI_ChangeCS(self.index, 1)
-        if not success or not released:
-            raise RuntimeError(f"SPI FIFO 连续读取失败 ({length} 字节)")
+        self._exchange(buf, f"SPI FIFO 连续读取 ({length} 字节)")
         return bytes(buf[1:])
-
-    # # JXX single cmd+data
-    # def read_fifo(self, length):
-    #     """Read reg100 continuously under one CS (manual section 7, Fig.7)."""
-    #     if not self.opened:
-    #         raise RuntimeError("CH347 尚未打开")
-    #     if not 0 <= length <= FIFO_SIZE:
-    #         raise ValueError("RX FIFO 单次读取长度必须在 0..63 之间")
-    #     if not length:
-    #         return b""
-    #     buf = (c_ubyte * (2))(0xE4, 0xFF)
-    #     read_buf = []
-    #     for i in range(10):
-    #         if not self.dll.CH347SPI_ChangeCS(self.index, 0):
-    #             raise RuntimeError("CH347 拉低 CS 失败")
-    #         try:
-    #             success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
-    #         finally:
-    #             released = self.dll.CH347SPI_ChangeCS(self.index, 1)
-    #         if not success or not released:
-    #             raise RuntimeError(f"SPI FIFO 连续读取失败 ({length} 字节)")
-    #         read_buf.append(buf[1])
-    #     # print(f"-JXX read buf: {read_buf}")
-    #     # print(f"-JXX bytes read buf: {list(bytes(read_buf))}")
-    #     return bytes(read_buf)
-    
 
     def transfer_fifo(self, data):
         """Write FIFO per WL1606A manual Fig.7: one 0x64 then N bytes.
@@ -214,14 +203,7 @@ class CH347SPI:
         if not data:
             return 0
         buf = (c_ubyte * (len(data) + 1))(0x64, *data)
-        if not self.dll.CH347SPI_ChangeCS(self.index, 0):
-            raise RuntimeError("CH347 拉低 CS 失败")
-        try:
-            success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
-        finally:
-            released = self.dll.CH347SPI_ChangeCS(self.index, 1)
-        if not success or not released:
-            raise RuntimeError(f"SPI FIFO 连续写入失败 ({len(data)} 字节)")
+        self._exchange(buf, f"SPI FIFO 连续写入 ({len(data)} 字节)")
         return len(data)
 
 
@@ -268,8 +250,10 @@ class DryRunSPI:
 
 
 class WL1606:
-    def __init__(self, spi, verbose=False, sleep=time.sleep):
-        self.spi, self.verbose, self.sleep = spi, verbose, sleep
+    def __init__(self, spi, verbose=False, spi_mode = "3-wire", sleep=time.sleep):
+        self.spi, self.verbose, self.spi_mode, self.sleep = spi, verbose, spi_mode, sleep
+        if spi_mode not in ("3-wire", "4-wire"):
+            raise ValueError("spi mode must be 3-wire or 4-wire")
 
     def write(self, address, value):
         self.spi.transfer(address, value)
@@ -279,7 +263,7 @@ class WL1606:
     def read(self, address):
         value = self.spi.transfer(address, read=True)
         if self.verbose:
-            #JXX TODO
+            # Note
             if address != 0x61:
                 print(f"read={address:02X} {value:02X}")
         return value
@@ -330,10 +314,11 @@ class WL1606:
         self.write(0x20, 0x80)
         self.sleep(0.010)
         self.write(0x06, 0x7A)
-        # JXX: 3wire
-        self.write(0x5E, 0x80)
-        # JXX: 4wire
-        #self.write(0x5E, 0x00)
+        if self.spi_mode == "3-wire":
+            self.write(0x5E, 0x80)
+        elif self.spi_mode == "4-wire":
+            self.write(0x5E, 0x00)
+        
         self.sleep(0.010)
         for address, value in RF_INIT:
             self.write(address, value)
@@ -346,7 +331,8 @@ class WL1606:
                     )
         self.write_sequence(((0x41, 0x03), (0x49, 0x71), (0x48, 0x91),
                              (0x4B, 0x7D), (0x4A, 0x6B), (0x4D, 0x5C)))
-        self.update(0x52, clear=0x20)
+        #JXX Note: cfg reg 0x52 must be cancelled; otherwise, the read fifo will not contain the expected data.
+        #self.update(0x52, clear=0x20)
         # Bit7 selects fixed length (7-bit length field). LONG_PAYLOAD_EN
         # instead uses length in FIFO. Explicit 0 restores that reset mode.
         self.write(0x5F, (0x80 | length) if length <= FIFO_SIZE else 0x00)
@@ -539,6 +525,14 @@ def parse_args(argv=None):
     parser.add_argument("--tx_test_mode", default=1, help="0=CW，1=packet (默认)；仅 TX")
     parser.add_argument("--out_rx_result_time", default=1000, help="RX 累计统计输出间隔，正毫秒数，默认 1000；仅 RX")
     parser.add_argument("--dev_index", type=integer, default=0, help="CH347 设备索引，默认 0")
+    parser.add_argument("--spi-cs-setup-us", type=integer, default=0,
+                        help="CH347 硬件 CS 建立延时 us，0..65535，默认0（最短）[Note: 实测无影响，开放便于实验]")
+    parser.add_argument("--spi-cs-hold-us", type=integer, default=0,
+                        help="CH347 硬件 CS 撤销前延时 us，0..4294967295，默认0（最短）[Note: 实测无影响，开放便于实验]")
+    parser.add_argument("--fifo-read-style", choices=("single", "burst"), default="single",
+                        help="RX FIFO: single=每字节独立 E4/CS（默认，匹配 MCU）；burst=一次 E4 连读")
+    parser.add_argument("--spi_mode", choices = ("3-wire", "4-wire"), default = "3-wire", 
+                        help = "选择spi模式，3-wire: 3线SPI； 4-wire: 4线SPI。默认：3-wire")
     parser.add_argument("--dll", help="CH347DLLA64.dll 路径，默认脚本同目录")
     parser.add_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
     parser.add_argument("--verbose", action="store_true", help="打印每笔寄存器读写（会减慢长包补充 FIFO）")
@@ -555,7 +549,8 @@ def parse_args(argv=None):
         except (ValueError, argparse.ArgumentTypeError) as exc:
             parser.error(f"--{name}: {exc}")
     ranges = [("len", 1 if args.mode else 0, FIFO_SIZE if args.mode else 255),
-              ("chan", 0, 80), ("dev_index", 0, 0xFFFFFFFF)]
+              ("chan", 0, 80), ("dev_index", 0, 0xFFFFFFFF),
+              ("spi_cs_setup_us", 0, 65535), ("spi_cs_hold_us", 0, 0xFFFFFFFF)]
     if not args.mode:
         ranges.extend((("tx_cnt", 1, 65535), ("tx_pwr", 1, 15), ("tx_test_mode", 0, 1)))
     for name, low, high in ranges:
@@ -581,10 +576,12 @@ def main(argv=None):
         reg, dbm = POWER_TABLE[args.tx_pwr - 1]
         print(f"模式=TX {'CW' if args.tx_test_mode == 0 else 'packet'}, 频率={2400 + args.chan} MHz, "
               f"功率档={args.tx_pwr} (约 {dbm:g} dBm, reg12=0x{reg:02X})")
-    spi = DryRunSPI() if args.dry_run else CH347SPI(args.dev_index, args.dll)
+    spi = DryRunSPI() if args.dry_run else CH347SPI(
+        args.dev_index, args.dll, fifo_read_style=args.fifo_read_style,
+        cs_setup_us=args.spi_cs_setup_us, cs_hold_us=args.spi_cs_hold_us)
     if args.dry_run:
         spi.rx_mode = bool(args.mode)
-    radio = WL1606(spi, args.verbose, (lambda seconds: None) if args.dry_run else time.sleep)
+    radio = WL1606(spi, args.verbose, args.spi_mode, (lambda seconds: None) if args.dry_run else time.sleep)
     opened = False
     result = 0
     try:
