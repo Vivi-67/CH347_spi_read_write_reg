@@ -13,11 +13,14 @@ whitening/auto-ACK. HS6220 software guards/CRC in main.c are not enabled.
 Payload bits are reversed before FIFO writes, as in the packet trace
 (0x20..0x26 -> 0x04,0x84,0x44,0xC4,0x24,0xA4,0x64).
 
-0..63 bytes use fixed length. 64..255 bytes follow LONG_PAYLOAD_EN:
-length byte (not bit-reversed), initial FIFO fill, then threshold refills.
-Long packets require hardware validation: the C source calls for 10-Mbit/s
-SPI; even at 15 MHz, Python call overhead and the 2-us byte interval
-may underrun the FIFO.
+TX 0..63 bytes use fixed length; RX accepts 1..63 bytes. For TX 64..255,
+only the initial 63 FIFO bytes (length prefix + 62 payload bytes) are loaded:
+threshold refills, completion polling and timeout handling are commented out.
+SPI is Mode 1, MSB first, 468.75 kHz, automatic CS, byte interval 0.
+--spi_mode selects the radio's reg0x5E setting for packet TX/RX only;
+it does not turn CH347's four-wire WriteRead API into half-duplex SDIO.
+RX reads one byte per E4/CS by default; --fifo-read-style burst reads a block.
+Each completed RX packet rearms RX; idle timeout currently only resets a timer.
 --dry-run validates logic with simulated flags; it does not validate RF.
 """
 
@@ -117,17 +120,18 @@ class CH347SPI:
             raise RuntimeError(f"无法打开 CH347，设备索引 {self.index}")
         self.opened = True
         cfg = SPI_CONFIG()
-        cfg.mMode = 1
-        cfg.mClock = 7  # CH347 clock. 2: 60 MHz / 2**2 = 15 MHz
+        cfg.mMode = 1  # CPOL=0, CPHA=1
+        cfg.mClock = 7  # Fixed clock index: 468.75 kHz; not a CLI parameter.
         cfg.mByteOrder = 1
-        # Hardware interval in us; correct packed ABI is required.
+        # 字节间隔固定为0；当前设备实测设1时自动片选下CSN保持高，原因未确认。
+        # 手动调用CH347SPI_ChangeCS控制CS，调整此参数能够调整addr与data之间的间隔
         cfg.mSPIWriteReadInterval = 0
         cfg.mSpiOutDefaultData = 0x00
         cfg.mChipSelect = 0x80
         cfg.mIsAutoDeactiveCS = 1
 
-        # Device-side delays, not Python sleeps. Zero requests minimum latency.
-        # 实测无影响
+        # 以下参数写入DLL配置，默认0；当前实测调整未观察到时序变化。
+        # 保留用于实验，不保证引脚上的精确延时，也不控制CS高电平间隔。
         cfg.mActiveDelayNum = self.cs_setup_us
         cfg.mDelayNum = self.cs_hold_us
 
@@ -171,7 +175,7 @@ class CH347SPI:
                 raise RuntimeError("CH347CloseDevice 失败")
 
     def read_fifo(self, length):
-        """Match MCU reg100 reads: one E4 + one byte per CS assertion.
+        """Default: one E4 + one byte per CS; burst: one E4 + length bytes.
 
         This changes framing only. SPI4 WriteRead does not release MOSI
         for a true three-wire SDIO turnaround; check board wiring.
@@ -263,7 +267,7 @@ class WL1606:
     def read(self, address):
         value = self.spi.transfer(address, read=True)
         if self.verbose:
-            # Note
+            # 高频轮询的reg0x61不打印，避免每次等待都输出日志。
             if address != 0x61:
                 print(f"read={address:02X} {value:02X}")
         return value
@@ -314,6 +318,7 @@ class WL1606:
         self.write(0x20, 0x80)
         self.sleep(0.010)
         self.write(0x06, 0x7A)
+        # 只切换WL1606端接口配置；CH347仍通过四线WriteRead API收发。
         if self.spi_mode == "3-wire":
             self.write(0x5E, 0x80)
         elif self.spi_mode == "4-wire":
@@ -348,6 +353,8 @@ class WL1606:
             self.set_power(power)
 
     def arm_rx(self, init_flag = 0):
+        # 当前重启顺序：清包标志、退出RX/清TX_EN、等待、使能RX、清FIFO指针。
+        # 初始化额外清TX FIFO；RX FIFO指针按当前调试序列连续清两次。
         # Wl16xx_Clean_Pkg_Flag
         self.update(0x25, set_bits=0x03)
         #self.write(0x25, 0x32)
@@ -362,19 +369,8 @@ class WL1606:
         self.update(0x69, set_bits=0x80)
         self.update(0x69, set_bits=0x80)
 
-    # def arm_rx(self):
-    #     # Clear RX_EN before toggling it, as in Wl16xx_RX_Mode. Clear the
-    #     # read pointer and stale IRQs before enabling reception again.
-    #     self.update(0x0F, clear=0x80)
-    #     self.update(0x0E, clear=0x01)
-    #     self.update(0x69, set_bits=0x80)
-    #     self.update(0x25, set_bits=0x03)
-    #     self.sleep(0.000010)
-    #     self.update(0x0F, set_bits=0x80)
-
     def init_rx(self, length, channel):
-        # Same fixed-length, CRC-enabled, no-length-prefix wire format as
-        # the supplied RX sequence and the existing short-packet TX.
+        # reg0x5F选择固定包长；CRC正确后读取length字节，不读取长度前缀。
         self.init_packet(length, channel)
         self.arm_rx(1)
 
@@ -406,7 +402,7 @@ class WL1606:
         stream = bytes([len(payload)]) + wire_payload if len(payload) > FIFO_SIZE else wire_payload
         sent = min(len(stream), FIFO_SIZE)
         self.transfer_fifo(stream[:sent])
-        # Clear stale packet/FIFO IRQ before a new TX trigger.
+        # 清包/FIFO中断的调用当前停用；下面只切换RX_EN/TX_EN触发发送。
         #self.update(0x25, set_bits=0x03)
         self.update(0x0F, clear=0x80)
         self.update(0x0E, clear=0x01)
@@ -502,8 +498,7 @@ def run_rx(radio, args, clock=time.monotonic, sleep=time.sleep):
             stats.record(*packet)
             receive_deadline = now + RX_TIMEOUT_SECONDS
         elif now >= receive_deadline:
-            # Manual 8.3: exit RX on timeout, then resume waiting. This
-            # recovery timer is independent of the statistics interval.
+            # 当前空闲1秒仅更新计时器，不退出/重启RX；arm_rx调用已停用。
             # radio.arm_rx()
             receive_deadline = clock() + RX_TIMEOUT_SECONDS
         if now >= next_report:
