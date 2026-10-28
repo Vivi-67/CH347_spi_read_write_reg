@@ -114,14 +114,14 @@ class CH347SPI:
         # 0：transfer_fifo时，每个tx_data之间连续发送，无间隔； 
         # 1：transfer_fifo时，每个tx_data之间间隔257us发送； 
         # 2：transfer_fifo时，每个tx_data之间间隔513us发送；
-        cfg.mSPIWriteReadInterval = 0
+        cfg.mSPIWriteReadInterval = 0 #0
         cfg.mSpiOutDefaultData = 0x00
         cfg.mChipSelect = 0x80
         cfg.mIsAutoDeactiveCS = 1
 
-        # # JXX: add
-        # cfg.mActiveDelayNum = 0
-        # cfg.mDelayNum = 0
+        # # # JXX: add
+        # cfg.mActiveDelayNum = 3
+        # cfg.mDelayNum = 3
 
         self.spi_clk = float(re.search(r"[+-]?\d*\.?\d+", SPI_CLK_MHz[cfg.mClock]).group())
         
@@ -173,6 +173,32 @@ class CH347SPI:
         if not success or not released:
             raise RuntimeError(f"SPI FIFO 连续读取失败 ({length} 字节)")
         return bytes(buf[1:])
+
+    # # JXX single cmd+data
+    # def read_fifo(self, length):
+    #     """Read reg100 continuously under one CS (manual section 7, Fig.7)."""
+    #     if not self.opened:
+    #         raise RuntimeError("CH347 尚未打开")
+    #     if not 0 <= length <= FIFO_SIZE:
+    #         raise ValueError("RX FIFO 单次读取长度必须在 0..63 之间")
+    #     if not length:
+    #         return b""
+    #     buf = (c_ubyte * (2))(0xE4, 0xFF)
+    #     read_buf = []
+    #     for i in range(10):
+    #         if not self.dll.CH347SPI_ChangeCS(self.index, 0):
+    #             raise RuntimeError("CH347 拉低 CS 失败")
+    #         try:
+    #             success = self.dll.CH347SPI_WriteRead(self.index, 0x80, len(buf), buf)
+    #         finally:
+    #             released = self.dll.CH347SPI_ChangeCS(self.index, 1)
+    #         if not success or not released:
+    #             raise RuntimeError(f"SPI FIFO 连续读取失败 ({length} 字节)")
+    #         read_buf.append(buf[1])
+    #     # print(f"-JXX read buf: {read_buf}")
+    #     # print(f"-JXX bytes read buf: {list(bytes(read_buf))}")
+    #     return bytes(read_buf)
+    
 
     def transfer_fifo(self, data):
         """Write FIFO per WL1606A manual Fig.7: one 0x64 then N bytes.
@@ -253,7 +279,9 @@ class WL1606:
     def read(self, address):
         value = self.spi.transfer(address, read=True)
         if self.verbose:
-            print(f"read={address:02X} {value:02X}")
+            #JXX TODO
+            if address != 0x61:
+                print(f"read={address:02X} {value:02X}")
         return value
 
     def update(self, address, clear=0, set_bits=0):
@@ -302,7 +330,10 @@ class WL1606:
         self.write(0x20, 0x80)
         self.sleep(0.010)
         self.write(0x06, 0x7A)
+        # JXX: 3wire
         self.write(0x5E, 0x80)
+        # JXX: 4wire
+        #self.write(0x5E, 0x00)
         self.sleep(0.010)
         for address, value in RF_INIT:
             self.write(address, value)
@@ -325,25 +356,41 @@ class WL1606:
         self.write(0x40, (self.read(0x40) & 0x03) | 0x88)
         self.write_sequence(((0x50, 0x68), (0x51, 0x44),
                              (0x0F, channel), (0x46, 0x03)))
+        self.update(0x69, set_bits=0x80)
+
         if power is not None:
             self.set_power(power)
-        self.update(0x68, set_bits=0x80)
 
-    def arm_rx(self):
-        # Clear RX_EN before toggling it, as in Wl16xx_RX_Mode. Clear the
-        # read pointer and stale IRQs before enabling reception again.
+    def arm_rx(self, init_flag = 0):
+        # Wl16xx_Clean_Pkg_Flag
+        self.update(0x25, set_bits=0x03)
+        #self.write(0x25, 0x32)
+        # Wl16xx_RX_Mode
         self.update(0x0F, clear=0x80)
         self.update(0x0E, clear=0x01)
-        self.update(0x69, set_bits=0x80)
-        self.update(0x25, set_bits=0x03)
         self.sleep(0.000010)
         self.update(0x0F, set_bits=0x80)
+        if init_flag:
+            self.update(0x68, set_bits=0x80)
+        # Wl16xx_Clean_Rx_Fifo
+        self.update(0x69, set_bits=0x80)
+        self.update(0x69, set_bits=0x80)
+
+    # def arm_rx(self):
+    #     # Clear RX_EN before toggling it, as in Wl16xx_RX_Mode. Clear the
+    #     # read pointer and stale IRQs before enabling reception again.
+    #     self.update(0x0F, clear=0x80)
+    #     self.update(0x0E, clear=0x01)
+    #     self.update(0x69, set_bits=0x80)
+    #     self.update(0x25, set_bits=0x03)
+    #     self.sleep(0.000010)
+    #     self.update(0x0F, set_bits=0x80)
 
     def init_rx(self, length, channel):
         # Same fixed-length, CRC-enabled, no-length-prefix wire format as
         # the supplied RX sequence and the existing short-packet TX.
         self.init_packet(length, channel)
-        self.arm_rx()
+        self.arm_rx(1)
 
     def receive_packet(self, expect_len):
         """Return None while waiting, or (CRC error, decoded payload).
@@ -357,6 +404,7 @@ class WL1606:
         try:
             crc_error = bool(self.read(0x60) & 0x80)
             if crc_error:
+                print("CRC err!!!")
                 return True, b""
             wire_payload = self.spi.read_fifo(expect_len)
             if self.verbose:
@@ -443,9 +491,6 @@ class RxStats:
             self.invalid_pkt_cnt += 1
         else:
             self.rx_cnt += 1
-            #JXX
-            while True:
-                pass
 
     def report(self):
         print(f"Rx cnt: {self.rx_cnt}, Crc_err_cnt: {self.crc_err_cnt},  Invalid pkt cnt:{self.invalid_pkt_cnt}", flush=True)
@@ -473,7 +518,7 @@ def run_rx(radio, args, clock=time.monotonic, sleep=time.sleep):
         elif now >= receive_deadline:
             # Manual 8.3: exit RX on timeout, then resume waiting. This
             # recovery timer is independent of the statistics interval.
-            radio.arm_rx()
+            # radio.arm_rx()
             receive_deadline = clock() + RX_TIMEOUT_SECONDS
         if now >= next_report:
             stats.report()
