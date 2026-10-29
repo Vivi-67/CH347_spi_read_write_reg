@@ -1,10 +1,14 @@
 """WL1606 CW/packet TX and short-packet RX test through CH347.
 
 Examples::
+    tx:
     python wl160x_test_mode.py --tx_test_mode 0 --chan 40 --tx_pwr 1
     python wl160x_test_mode.py --len 20 --pkt_type 0x55 --tx_cnt 100
+    python wl160x_test_mode.py --len 0x3c --pkt_type 0x55 --tx_cnt 10 --tx_interval 0 --tx_pwr 1 --chan 40 --tx_test_mode 1
+
+    rx:
     python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000
-    python wl160x_test_mode.py --dry-run --tx_cnt 2 --verbose
+    python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000 --chan 40  --fifo-read-style burst
 
 References: source/Dri_Wl1606.c (Init/TxLoop), both WL1606 TX register
 sequences, wl1606_脚本参数说明.txt and wl1606功率档位映射.png.
