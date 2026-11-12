@@ -1,0 +1,75 @@
+# Proxima Phase 4: Check and Trim HSI Clock、16MHz Clock and the voltages
+############# clk/trim cfg #############
+delay 10
+r4 0x1020
+#Enable 16M, 0x1020[20]=1
+w4 0x1020 0x198401 
+delay 10
+r4 0x1020
+
+r4 0x100C
+#trim VCORE and VDIG
+w4 0x100C 0x8504F17 
+#w4 0x100C 0x8504FF7
+delay 10
+r4 0x100C
+
+############## phase 5 #############
+#Initialize all CH/DC calibration memory entries, with readback verification.
+clear_cal_mem
+
+# Disable Modem: bypass and hold reset, per system initialization flow.
+setbits 0x1018 [31] 1
+#setbits 0x1018 [18:17] 3
+check 0x1018 0x80003400 32 0x80003400
+
+# channel cfg  
+#w4 0x1028 0x0
+w4 0x1028 0x9
+# channel cfg alt
+# setbits 0x3030 [10:4] 0
+# setbits 0x3030 [11] 1
+
+# comm_1: rg_bt_tx_mode=1, rg_bt_tx_mode_manual=1, rg_rf_fsm_manual=1, rg_rf_fsm=FSM PLLIDLE
+w4 0x3004 0x200B40
+
+# comm_1: rg_bt_tx_mode=1, rg_bt_tx_mode_manual=1, rg_rf_fsm_manual=1, rg_rf_fsm=FSM RESET AFC
+w4 0x3004 0x200BB0
+
+# comm_1: FSM PLLAFC
+w4 0x3004 0x200B20
+
+# comm_1: check bit14=1, AD_SX_AFC_FINISH
+delay 10
+check 0x3004 0x4000 32 0x4000
+# AFC1 calibration DONE
+
+# TODO: AFC2 calibration
+
+# sx_6: sx_dac_data_sdm_reg_en=1, sx_dac_data_reg_en=1.  TX-related
+#w4 0x3098 0xC0000300
+
+## TODO: test add
+## Tx
+#w4 0x308c 0x1187C6
+#w4 0x1018 0x8001F400
+
+# rftop_pa: PA force max gain.  TX-related
+#w4 0x3074 0x21FFC6
+#w4 0x3074 0x2100c0
+
+
+## comm_1: FSM TX
+#w4 0x3004 0x200B60
+
+## comm_1: FSM RX
+w4 0x3004 0x201550
+
+# rftop_test test_pad
+#w4 0x307C 0x3
+
+
+##diag prot tport
+#setbits 0x3004 [3:0] 10
+#setbits 0x1018 [31] 0
+#setbits 0x1018 [3] 1
