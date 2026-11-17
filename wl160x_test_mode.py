@@ -624,7 +624,7 @@ def main(argv=None):
     finally:
         if opened:
             try:
-                #radio.sleep(1)
+                radio.sleep(1)
                 radio.stop()
             except Exception as exc:
                 print(f"停止 WL1606 失败: {exc}", file=sys.stderr)
