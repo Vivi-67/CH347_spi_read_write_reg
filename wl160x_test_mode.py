@@ -603,6 +603,7 @@ def main(argv=None):
             radio.init_packet(args.len, args.chan, args.tx_pwr)
             limit = 1 if args.dry_run and args.tx_cnt == 0xFFFF else args.tx_cnt
             count = 0
+            print(f"-JXX limit = {limit}, tx_cnt = {args.tx_cnt}")
             while args.tx_cnt == 0xFFFF or count < limit:
                 radio.send_packet(make_payload(args.len, args.pkt_type), args.tx_timeout)
                 count += 1
@@ -615,7 +616,7 @@ def main(argv=None):
                         radio.sleep(args.tx_interval / 1000.0)
                     else:
                         # 如果设置的interval为0，也要手动加入100us的延时（实际测会延时700us左右），否则发送的空口数据包会有误码
-                        radio.sleep(0.0001)
+                        radio.sleep(0.0002)
     except KeyboardInterrupt:
         print("\n收到 Ctrl+C，停止接收。" if args.mode else "\n收到 Ctrl+C，停止发送。")
     except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
@@ -624,6 +625,7 @@ def main(argv=None):
     finally:
         if opened:
             try:
+                #radio.sleep(1)
                 radio.stop()
             except Exception as exc:
                 print(f"停止 WL1606 失败: {exc}", file=sys.stderr)
