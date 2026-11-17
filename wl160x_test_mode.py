@@ -603,7 +603,6 @@ def main(argv=None):
             radio.init_packet(args.len, args.chan, args.tx_pwr)
             limit = 1 if args.dry_run and args.tx_cnt == 0xFFFF else args.tx_cnt
             count = 0
-            print(f"-JXX limit = {limit}, tx_cnt = {args.tx_cnt}")
             while args.tx_cnt == 0xFFFF or count < limit:
                 radio.send_packet(make_payload(args.len, args.pkt_type), args.tx_timeout)
                 count += 1
