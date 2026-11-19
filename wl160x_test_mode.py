@@ -408,6 +408,7 @@ class WL1606:
         self.transfer_fifo(stream[:sent])
         # 清包/FIFO中断的调用当前停用；下面只切换RX_EN/TX_EN触发发送。
         #self.update(0x25, set_bits=0x03)
+        self.sleep(0.000030)
         self.update(0x0F, clear=0x80)
         self.update(0x0E, clear=0x01)
         # Note: 实际两条spi cmd+data之间存在200us左右的间隔，
