@@ -373,9 +373,23 @@ class WL1606:
         self.update(0x69, set_bits=0x80)
         self.update(0x69, set_bits=0x80)
 
-    def init_rx(self, length, channel):
+    def init_rx(self, length, channel, perf_mode):
         # reg0x5F选择固定包长；CRC正确后读取length字节，不读取长度前缀。
         self.init_packet(length, channel)
+
+        if perf_mode == 'hp':
+            #print("RX HP cfg")
+            self.write(0x00, 0x7F)
+            self.write(0x01, 0xE9)
+        if perf_mode == 'lp':
+            self.write(0x00, 0x73)
+            self.write(0x01, 0xE1)
+            #print("RX LP cfg")
+            
+        #va_00 = self.read(0x00)
+        #va_01 = self.read(0x01)
+        #print(f"---------- va_00 = {va_00:#X},  va_01 = {va_01:#X}")
+
         self.arm_rx(1)
 
     def receive_packet(self, expect_len):
@@ -533,6 +547,9 @@ def parse_args(argv=None):
                         help="RX FIFO: single=每字节独立 E4/CS（默认，匹配 MCU）；burst=一次 E4 连读")
     parser.add_argument("--spi_mode", choices = ("3-wire", "4-wire"), default = "3-wire", 
                         help = "选择spi模式，3-wire: 3线SPI； 4-wire: 4线SPI。默认：3-wire")
+    parser.add_argument("--rx_perf_mode", choices = ("lp", "hp"), default = "hp", 
+                                help = "Rx选择LP模式，还是HP模式。默认：HP")
+    parser.add_argument("--lp", action = "store_true", help = "Rx LP版本配置")
     parser.add_argument("--dll", help="CH347DLLA64.dll 路径，默认脚本同目录")
     parser.add_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
     parser.add_argument("--verbose", action="store_true", help="打印每笔寄存器读写（会减慢长包补充 FIFO）")
@@ -588,7 +605,8 @@ def main(argv=None):
         spi.open()
         opened = True
         if args.mode:
-            radio.init_rx(args.len, args.chan)
+            radio.init_rx(args.len, args.chan, args.rx_perf_mode)
+            
             print("接收已开启，Ctrl+C 停止；以下三项均为本次运行的累计计数。")
             run_rx(radio, args)
         elif args.tx_test_mode == 0:
