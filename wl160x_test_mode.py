@@ -1,6 +1,10 @@
 """WL1606 CW/packet TX and short-packet RX test through CH347.
 
 Examples::
+    register access (one operation, then exit):
+    python wl160x_test_mode.py read 0x00
+    python wl160x_test_mode.py write 0x00 0x7F
+
     tx:
     python wl160x_test_mode.py --tx_test_mode 0 --chan 40 --tx_pwr 1
     python wl160x_test_mode.py --len 20 --pkt_type 0x55 --tx_cnt 100
@@ -9,6 +13,8 @@ Examples::
     rx:
     python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000
     python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000 --chan 40  --fifo-read-style burst
+    python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 32 --out_rx_result_time 1000 --chan 32 --rx_perf_mode lp
+    python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 32 --out_rx_result_time 1000 --chan 32 --rx_perf_mode hp
 
 References: source/Dri_Wl1606.c (Init/TxLoop), both WL1606 TX register
 sequences, wl1606_脚本参数说明.txt and wl1606功率档位映射.png.
@@ -554,7 +560,22 @@ def parse_args(argv=None):
     parser.add_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
     parser.add_argument("--verbose", action="store_true", help="打印每笔寄存器读写（会减慢长包补充 FIFO）")
     parser.add_argument("--dry-run", action="store_true", help="模拟 SPI；TX 无限次数时模拟 1 包；RX 输出一次零计数后退出")
+    commands = parser.add_subparsers(dest="command")
+    read_parser = commands.add_parser("read", help="读取一个寄存器后退出")
+    read_parser.add_argument("addr", type=integer, help="寄存器地址，0x00..0x7F")
+    write_parser = commands.add_parser("write", help="写入一个寄存器后退出")
+    write_parser.add_argument("addr", type=integer, help="寄存器地址，0x00..0x7F")
+    write_parser.add_argument("value", type=integer, help="写入值，0x00..0xFF")
     args = parser.parse_args(argv)
+    if args.command:
+        ranges = [("addr", 0, 0x7F), ("dev_index", 0, 0xFFFFFFFF),
+                  ("spi_cs_setup_us", 0, 65535), ("spi_cs_hold_us", 0, 0xFFFFFFFF)]
+        if args.command == "write":
+            ranges.append(("value", 0, 0xFF))
+        for name, low, high in ranges:
+            if not low <= getattr(args, name) <= high:
+                parser.error(f"{name} 必须在 {low}..{high} 之间")
+        return args
     # Convert/validate only parameters used by the selected direction.
     active = {"out_rx_result_time": float} if args.mode else {
         "tx_cnt": integer, "tx_pwr": integer, "tx_test_mode": integer,
@@ -586,10 +607,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.mode:
+    if not args.command and args.mode:
         print(f"模式=RX, 频率={2400 + args.chan} MHz, 预期 payload={args.len} 字节, "
               f"类型={args.pkt_type}, 统计间隔={args.out_rx_result_time:g} ms")
-    else:
+    elif not args.command:
         reg, dbm = POWER_TABLE[args.tx_pwr - 1]
         print(f"模式=TX {'CW' if args.tx_test_mode == 0 else 'packet'}, 频率={2400 + args.chan} MHz, "
               f"功率档={args.tx_pwr} (约 {dbm:g} dBm, reg12=0x{reg:02X})")
@@ -604,7 +625,22 @@ def main(argv=None):
     try:
         spi.open()
         opened = True
-        if args.mode:
+        if args.command == "read":
+            #radio.write(0x20, 0x80)
+            radio.sleep(0.010)
+            radio.write(0x06, 0x7A)
+            # 只切换WL1606端接口配置；CH347仍通过四线WriteRead API收发。
+            if radio.spi_mode == "3-wire":
+                radio.write(0x5E, 0x80)
+            elif radio.spi_mode == "4-wire":
+                radio.write(0x5E, 0x00)
+
+            value = radio.read(args.addr)
+            print(f"Read [0x{args.addr:02X}] = 0x{value:02X}")
+        elif args.command == "write":
+            radio.write(args.addr, args.value)
+            print(f"Write [0x{args.addr:02X}] = 0x{args.value:02X}")
+        elif args.mode:
             radio.init_rx(args.len, args.chan, args.rx_perf_mode)
             
             print("接收已开启，Ctrl+C 停止；以下三项均为本次运行的累计计数。")
@@ -643,8 +679,9 @@ def main(argv=None):
     finally:
         if opened:
             try:
-                radio.sleep(1)
-                radio.stop()
+                if not args.command:
+                    radio.sleep(1)
+                    radio.stop()
             except Exception as exc:
                 print(f"停止 WL1606 失败: {exc}", file=sys.stderr)
                 result = 1
