@@ -85,6 +85,28 @@ python wl160x_test_mode.py [--mode 0或1] [--spi_mode 3-wire或4-wire] [--fifo-r
 - 查看脚本帮助：`python wl160x_test_mode.py --help`。
 - **停止测试：在运行窗口按 `Ctrl+C`。** 脚本会尝试停止发射、复位 WL1606 并关闭 CH347。
 
+### 可重复的寄存器读写参数
+
+原 `read`、`write` 子命令改为 `--read ADDR`、`--write ADDR VALUE`，均可重复。
+地址范围为 `0x00～0x7F`，写入值范围为 `0x00～0xFF`，也支持十进制。
+
+```powershell
+# 仅访问指定寄存器，不初始化、不收发、不在退出时复位芯片
+python wl160x_test_mode.py --read 0x00
+python wl160x_test_mode.py --read 0x00 --read 0x02
+python wl160x_test_mode.py --write 0x00 0x73
+python wl160x_test_mode.py --write 0x00 0x73 --write 0x01 0xE2
+
+# RX：默认初始化后应用显式写入，再读取并显示指定寄存器，继续原有接收流程
+python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 32 --out_rx_result_time 1000 --chan 32 --rx_perf_mode lp --write 0x00 0x73 --write 0x01 0xE2 --read 0x00 --read 0x01
+```
+
+- 只有寄存器读写参数，以及连接、SPI、日志或 `--dry-run` 参数时，仅访问指定寄存器后关闭 CH347。仅写入而没有读取时，最后打印 `该配置可能被后续初始化所覆盖`。
+- 显式指定 `--mode`、`--tx_test_mode`、`--len`、`--pkt_type`、`--chan`、`--rx_perf_mode` 等测试参数时，保持相应 RX、packet TX 或 CW 功能；默认初始化完成后执行显式写入，再执行指定读取，然后继续测试。不带读写参数的命令行为保持不变。
+- RX 中，只要任一 `--write` 地址为 `0x00` 或 `0x01`，就整组跳过 `--rx_perf_mode` 对这两个寄存器的预设；仅写其中一个时，不会额外配置另一个。若只写其他地址，则保留 `--rx_perf_mode` 预设。单纯 `--read` 不影响预设。
+- 多次写入按 `--write` 出现顺序执行，同一地址以最后一次写入为准；所有显式写入完成后，按 `--read` 出现顺序读取，每项显示 `Read [0x00] = 0x73` 形式的结果。示例 `--read 0x00 --read 0x02` 读取的是 `0x00`、`0x02`，不会自动读取 `0x01`。
+- 离线回归测试：`python -B -m unittest test_wl160x_register_options -v`；不连接硬件。
+
 ## 3. 参数表
 
 | 参数 | 作用 | 范围或可选值 | 默认值 |

@@ -1,9 +1,10 @@
 """WL1606 CW/packet TX and short-packet RX test through CH347.
 
 Examples::
-    register access (one operation, then exit):
-    python wl160x_test_mode.py read 0x00
-    python wl160x_test_mode.py write 0x00 0x7F
+    register access (repeatable; without test options, then exit):
+    python wl160x_test_mode.py --read 0x00 --read 0x02
+    python wl160x_test_mode.py --write 0x00 0x73 --write 0x01 0xE2
+    python wl160x_test_mode.py --mode 1 --pkt_type 0x55 --len 10 --out_rx_result_time 1000 --write 0x00 0x73 --write 0x01 0xE2
 
     tx:
     python wl160x_test_mode.py --tx_test_mode 0 --chan 40 --tx_pwr 1
@@ -458,6 +459,7 @@ class WL1606:
         # Clearing TX_EN also turns off the continuous carrier (0x05 -> 0x04).
         self.update(0x0E, clear=0x01)
         self.update(0x0F, clear=0x80)
+        print("Software Reset")
         self.write(0x20, 0x80)
         self.sleep(0.010)
 
@@ -534,16 +536,23 @@ def run_rx(radio, args, clock=time.monotonic, sleep=time.sleep):
 
 
 def parse_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", type=integer, choices=(0, 1), default=0, help="0=TX (默认)，1=RX")
-    parser.add_argument("--len", "--tx_len", dest="len", type=integer, default=20, help="payload 字节数，TX 0..255，RX 短包 1..63，默认 20")
-    parser.add_argument("--pkt_type", "--tx_pkt_type", dest="pkt_type", type=packet_type, default="0xff", help="默认全 1；random 仅限 TX")
-    parser.add_argument("--chan", "--tx_chan", dest="chan", type=integer, default=40, help="0..80，频率=2400+chan MHz，默认40")
-    parser.add_argument("--tx_cnt", default=0xFFFF, help="1..65534 次；65535=持续发送；默认：0xFFFF；仅 TX")
-    parser.add_argument("--tx_interval", default=20, help="两包之间 sleep 毫秒，默认 20；仅 TX")
-    parser.add_argument("--tx_pwr", default=1, help="1..15，默认 1 (8 dBm，最大)；仅 TX")
-    parser.add_argument("--tx_test_mode", default=1, help="0=CW，1=packet (默认)；仅 TX")
-    parser.add_argument("--out_rx_result_time", default=1000, help="RX 累计统计输出间隔，正毫秒数，默认 1000；仅 RX")
+    test_options = []
+
+    def add_test_argument(*flags, **kwargs):
+        test_options.extend(flags)
+        parser.add_argument(*flags, **kwargs)
+
+    add_test_argument("--mode", type=integer, choices=(0, 1), default=0, help="0=TX (默认)，1=RX")
+    add_test_argument("--len", "--tx_len", dest="len", type=integer, default=20, help="payload 字节数，TX 0..255，RX 短包 1..63，默认 20")
+    add_test_argument("--pkt_type", "--tx_pkt_type", dest="pkt_type", type=packet_type, default="0xff", help="默认全 1；random 仅限 TX")
+    add_test_argument("--chan", "--tx_chan", dest="chan", type=integer, default=40, help="0..80，频率=2400+chan MHz，默认40")
+    add_test_argument("--tx_cnt", default=0xFFFF, help="1..65534 次；65535=持续发送；默认：0xFFFF；仅 TX")
+    add_test_argument("--tx_interval", default=20, help="两包之间 sleep 毫秒，默认 20；仅 TX")
+    add_test_argument("--tx_pwr", default=1, help="1..15，默认 1 (8 dBm，最大)；仅 TX")
+    add_test_argument("--tx_test_mode", default=1, help="0=CW，1=packet (默认)；仅 TX")
+    add_test_argument("--out_rx_result_time", default=1000, help="RX 累计统计输出间隔，正毫秒数，默认 1000；仅 RX")
     parser.add_argument("--dev_index", type=integer, default=0, help="CH347 设备索引，默认 0")
     parser.add_argument("--spi-cs-setup-us", type=integer, default=0,
                         help="CH347 硬件 CS 建立延时 us，0..65535，默认0（最短）[Note: 实测无影响，开放便于实验]")
@@ -553,28 +562,36 @@ def parse_args(argv=None):
                         help="RX FIFO: single=每字节独立 E4/CS（默认，匹配 MCU）；burst=一次 E4 连读")
     parser.add_argument("--spi_mode", choices = ("3-wire", "4-wire"), default = "3-wire", 
                         help = "选择spi模式，3-wire: 3线SPI； 4-wire: 4线SPI。默认：3-wire")
-    parser.add_argument("--rx_perf_mode", choices = ("lp", "hp"), default = "hp", 
+    add_test_argument("--rx_perf_mode", choices = ("lp", "hp"), default = "hp",
                                 help = "Rx选择LP模式，还是HP模式。默认：HP")
-    parser.add_argument("--lp", action = "store_true", help = "Rx LP版本配置")
+    add_test_argument("--lp", action = "store_true", help = "Rx LP版本配置")
     parser.add_argument("--dll", help="CH347DLLA64.dll 路径，默认脚本同目录")
-    parser.add_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
+    add_test_argument("--tx_timeout", default=1000, help="每包完成超时毫秒，默认 1000；仅 TX（当前 TX 未启用完成轮询）")
     parser.add_argument("--verbose", action="store_true", help="打印每笔寄存器读写（会减慢长包补充 FIFO）")
     parser.add_argument("--dry-run", action="store_true", help="模拟 SPI；TX 无限次数时模拟 1 包；RX 输出一次零计数后退出")
-    commands = parser.add_subparsers(dest="command")
-    read_parser = commands.add_parser("read", help="读取一个寄存器后退出")
-    read_parser.add_argument("addr", type=integer, help="寄存器地址，0x00..0x7F")
-    write_parser = commands.add_parser("write", help="写入一个寄存器后退出")
-    write_parser.add_argument("addr", type=integer, help="寄存器地址，0x00..0x7F")
-    write_parser.add_argument("value", type=integer, help="写入值，0x00..0xFF")
+    parser.add_argument("--read", type=integer, action="append", default=[], metavar="ADDR",
+                        help="读取寄存器 0x00..0x7F，可重复；无测试参数时仅读取后退出")
+    parser.add_argument("--write", type=integer, nargs=2, action="append", default=[], metavar=("ADDR", "VALUE"),
+                        help="写入寄存器，地址 0x00..0x7F、值 0x00..0xFF，可重复；测试时在默认初始化后写入")
     args = parser.parse_args(argv)
-    if args.command:
-        ranges = [("addr", 0, 0x7F), ("dev_index", 0, 0xFFFFFFFF),
-                  ("spi_cs_setup_us", 0, 65535), ("spi_cs_hold_us", 0, 0xFFFFFFFF)]
-        if args.command == "write":
-            ranges.append(("value", 0, 0xFF))
-        for name, low, high in ranges:
-            if not low <= getattr(args, name) <= high:
-                parser.error(f"{name} 必须在 {low}..{high} 之间")
+    for address in args.read + [address for address, _ in args.write]:
+        if not 0 <= address <= 0x7F:
+            parser.error("--read/--write 的寄存器地址必须在 0..127 之间")
+    for _, value in args.write:
+        if not 0 <= value <= 0xFF:
+            parser.error("--write 的寄存器值必须在 0..255 之间")
+    # Connection/logging options do not start a test. Match argparse's accepted
+    # long-option abbreviations as well as --option=value and legacy aliases.
+    args.register_only = bool(args.read or args.write) and not any(
+        option.startswith(token.split("=", 1)[0])
+        for token in argv if token.startswith("--")
+        for option in test_options
+    )
+    for name, low, high in (("dev_index", 0, 0xFFFFFFFF),
+                            ("spi_cs_setup_us", 0, 65535), ("spi_cs_hold_us", 0, 0xFFFFFFFF)):
+        if not low <= getattr(args, name) <= high:
+            parser.error(f"--{name} 必须在 {low}..{high} 之间")
+    if args.register_only:
         return args
     # Convert/validate only parameters used by the selected direction.
     active = {"out_rx_result_time": float} if args.mode else {
@@ -587,8 +604,7 @@ def parse_args(argv=None):
         except (ValueError, argparse.ArgumentTypeError) as exc:
             parser.error(f"--{name}: {exc}")
     ranges = [("len", 1 if args.mode else 0, FIFO_SIZE if args.mode else 255),
-              ("chan", 0, 80), ("dev_index", 0, 0xFFFFFFFF),
-              ("spi_cs_setup_us", 0, 65535), ("spi_cs_hold_us", 0, 0xFFFFFFFF)]
+              ("chan", 0, 80)]
     if not args.mode:
         ranges.extend((("tx_cnt", 1, 65535), ("tx_pwr", 1, 15), ("tx_test_mode", 0, 1)))
     for name, low, high in ranges:
@@ -605,12 +621,22 @@ def parse_args(argv=None):
     return args
 
 
+def access_registers(radio, args):
+    """Apply explicit writes, then read the resulting configuration once."""
+    for address, value in args.write:
+        radio.write(address, value)
+        print(f"Write [0x{address:02X}] = 0x{value:02X}")
+    for address in args.read:
+        value = radio.read(address)
+        print(f"Read [0x{address:02X}] = 0x{value:02X}")
+
+
 def main(argv=None):
     args = parse_args(argv)
-    if not args.command and args.mode:
+    if not args.register_only and args.mode:
         print(f"模式=RX, 频率={2400 + args.chan} MHz, 预期 payload={args.len} 字节, "
               f"类型={args.pkt_type}, 统计间隔={args.out_rx_result_time:g} ms")
-    elif not args.command:
+    elif not args.register_only:
         reg, dbm = POWER_TABLE[args.tx_pwr - 1]
         print(f"模式=TX {'CW' if args.tx_test_mode == 0 else 'packet'}, 频率={2400 + args.chan} MHz, "
               f"功率档={args.tx_pwr} (约 {dbm:g} dBm, reg12=0x{reg:02X})")
@@ -625,8 +651,7 @@ def main(argv=None):
     try:
         spi.open()
         opened = True
-        if args.command == "read":
-            #radio.write(0x20, 0x80)
+        if args.register_only:
             radio.sleep(0.010)
             radio.write(0x06, 0x7A)
             # 只切换WL1606端接口配置；CH347仍通过四线WriteRead API收发。
@@ -634,14 +659,13 @@ def main(argv=None):
                 radio.write(0x5E, 0x80)
             elif radio.spi_mode == "4-wire":
                 radio.write(0x5E, 0x00)
-
-            value = radio.read(args.addr)
-            print(f"Read [0x{args.addr:02X}] = 0x{value:02X}")
-        elif args.command == "write":
-            radio.write(args.addr, args.value)
-            print(f"Write [0x{args.addr:02X}] = 0x{args.value:02X}")
+            access_registers(radio, args)
         elif args.mode:
-            radio.init_rx(args.len, args.chan, args.rx_perf_mode)
+            # Either explicit performance-register write disables the entire
+            # preset; do not implicitly change the other register of the pair.
+            perf_mode = None if any(address in (0x00, 0x01) for address, _ in args.write) else args.rx_perf_mode
+            radio.init_rx(args.len, args.chan, perf_mode)
+            access_registers(radio, args)
             
             print("接收已开启，Ctrl+C 停止；以下三项均为本次运行的累计计数。")
             run_rx(radio, args)
@@ -656,6 +680,8 @@ def main(argv=None):
             if args.len > FIFO_SIZE:
                 print("注意：当前 TX 长包补充 FIFO 未启用，超过 63 字节不能完成完整发送。")
             radio.init_packet(args.len, args.chan, args.tx_pwr)
+
+            access_registers(radio, args)
             limit = 1 if args.dry_run and args.tx_cnt == 0xFFFF else args.tx_cnt
             count = 0
             while args.tx_cnt == 0xFFFF or count < limit:
@@ -679,7 +705,7 @@ def main(argv=None):
     finally:
         if opened:
             try:
-                if not args.command:
+                if not args.register_only:
                     radio.sleep(1)
                     radio.stop()
             except Exception as exc:
@@ -692,6 +718,8 @@ def main(argv=None):
                 except Exception as exc:
                     print(f"关闭设备失败: {exc}", file=sys.stderr)
                     result = 1
+    if args.register_only and args.write and not args.read:
+        print("该配置可能被后续初始化所覆盖")
     return result
 
 
