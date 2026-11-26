@@ -86,7 +86,7 @@ class CH347SPI:
             if not self.dll.CH347SetTimeout(index, 1000, 1000):
                 raise RuntimeError("CH347SetTimeout 失败")
             cfg = SPI_CONFIG()
-            cfg.mMode = 0              # DSL: CPOL=0, CPHA=0（WL160x参考脚本实际为1）
+            cfg.mMode = 0              # DSL: CPOL=0, CPHA=0
             cfg.mClock = 5             # 5:1.875 MHz
             cfg.mByteOrder = 1         # CH347: 1=MSB first
             cfg.mSPIWriteReadInterval = 1
@@ -124,6 +124,24 @@ class CH347SPI:
                 self.dll.CH347CloseDevice(self.index)
 
 
+# 对应 samples/common/include/drv_ceres.h: enum CERES_CMD_TYPES
+CERES_CMD_RD_REGISTER = 0x00
+CERES_CMD_WR_REGISTER = 0x20
+CERES_CMD_RD_PAYLOAD = 0x61
+CERES_CMD_WR_PAYLOAD = 0xA0
+CERES_CMD_FLUSH_TX_FIFO = 0xE1
+CERES_CMD_FLUSH_RX_FIFO = 0xE2
+CERES_CMD_REUSE_TX_PAYLOAD = 0xE3
+CERES_CMD_RD_REG_BANK = 0x40
+CERES_CMD_WR_REG_BANK = 0x41
+CERES_CMD_RD_RX_LENGTH = 0x60
+CERES_CMD_WR_AUTOACK = 0xA8
+CERES_CMD_WR_TX_NOACK = 0xB0
+CERES_CMD_RESET_DBB = 0x8B
+CERES_CMD_SET_CE = 0xD5
+CERES_CMD_CLR_CE = 0xD6
+
+
 # drv_ceres.c 使用的寄存器地址
 AON_CTRL, AON_LINK_CTRL, AON_PWR_CFG, AON_RSVD = 0x0000, 0x0010, 0x0020, 0x0038
 COMM_1, AFC_0, AFC_1, AFC_5, AFC_6 = 0x4004, 0x4020, 0x4024, 0x4034, 0x4038
@@ -144,7 +162,7 @@ def register_command(address, write=False):
         raise ValueError("地址必须在0x0000..0xFFFF范围内")
     mod, offset = address >> 14, address & 0x3FFF
     bank = ((offset >> 5) | (mod << 6)) & 0xFF
-    return bank, (offset & 31) | (0x20 if write else 0x00)
+    return bank, (offset & 31) | (CERES_CMD_WR_REGISTER if write else CERES_CMD_RD_REGISTER)
 
 
 class Ceres:
@@ -153,6 +171,7 @@ class Ceres:
         self.verbose = verbose
         self.static_length = 0
         self.rx_partial = bytearray()
+        self.rx_count = 0  # CRC正确并成功读取的包数，包含长度/内容不匹配的包
         self.rx_fifo_recoveries = 0
         self.rx_fifo_fault_streak = 0
         self.last_bank = None          # 每次进程首次访问必选bank，避免依赖芯片旧状态
@@ -164,7 +183,7 @@ class Ceres:
 
     def select_bank(self, bank):
         if bank != self.last_bank:
-            self.frame(bytes((0x41, bank)), f"WR_REG_BANK=0x{bank:02X}")
+            self.frame(bytes((CERES_CMD_WR_REG_BANK, bank)), f"WR_REG_BANK=0x{bank:02X}")
             self.last_bank = bank
 
     def write_reg(self, address, value):
@@ -221,7 +240,7 @@ class Ceres:
         self.write_reg(AON_PWR_CFG, (4 << 25) | (1 << 23) | (0x10 << 16)
                        | (0xA << 12) | (8 << 8) | (3 << 5) | 0x10 | (3 << 1) | 1)
         self.write_reg(AON_RSVD, 0x88005455)
-        self.frame(b"\xD6", "CERES_CMD_CLR_CE")
+        self.frame(bytes((CERES_CMD_CLR_CE,)), "CERES_CMD_CLR_CE")
 
         print("--- drv_ceres_rf_init(): drv_ceres_afc_auto_calibration() ---")
         link = (1 << 20) | (1 << 9) | (1 << 8) | channel
@@ -292,8 +311,8 @@ class Ceres:
         return make_payload(length, kind)
 
     def stop_packet_tx(self):
-        self.command(0xD6)  # CERES_CMD_CLR_CE
-        self.command(0xE1)  # CERES_CMD_FLUSH_TX_FIFO
+        self.command(CERES_CMD_CLR_CE)
+        self.command(CERES_CMD_FLUSH_TX_FIFO)
 
     def drv_ceres_packet_handler(self, payload=None):
         """同步实现TX_CONT/W4_TXEND；无payload时处理一次RX状态。"""
@@ -301,23 +320,23 @@ class Ceres:
             return self.receive_packet()
         deadline = time.monotonic() + self.timeout
         try:
-            #self.command(0xD6)
-            #self.command(0xE1)
+            #self.command(CERES_CMD_CLR_CE)
+            #self.command(CERES_CMD_FLUSH_TX_FIFO)
             #self.write_reg(AON_IRQ_STATUS, self.irq_status())  # W1C，清除旧包完成
             sent = min(64, len(payload))  # CERES_TX_FIFO_SIZE
-            self.command(0xB0, payload[:sent])  # CERES_CMD_WR_TX_NOACK
-            self.command(0xD5)  # drv_ceres_trigger_start()
+            self.command(CERES_CMD_WR_TX_NOACK, payload[:sent])
+            self.command(CERES_CMD_SET_CE)  # drv_ceres_trigger_start()
             while True:
                 status = self.irq_status()
                 if status & PACKET_END:
                     if sent != len(payload):
                         raise RuntimeError("TX提前结束：FIFO未及时补充")
                     self.write_reg(AON_IRQ_STATUS, status)
-                    self.command(0xD6)
+                    self.command(CERES_CMD_CLR_CE)
                     return
                 if sent < len(payload) and status & TXFIFO_ALMOST_EMPTY:
                     end = min(sent + 40, len(payload))  # CERES_TX_CONT_SIZE
-                    self.command(0xB0, payload[sent:end])
+                    self.command(CERES_CMD_WR_TX_NOACK, payload[sent:end])
                     sent = end
                     self.write_reg(AON_IRQ_STATUS, TXFIFO_ALMOST_EMPTY)
                 if time.monotonic() >= deadline:
@@ -353,8 +372,9 @@ class Ceres:
 
     def drv_ceres_start_rx(self):
         print("--- drv_ceres_start_rx() ---")
-        self.command(0xD6)
-        self.command(0xE2)
+        self.rx_count = 0
+        self.command(CERES_CMD_CLR_CE)
+        self.command(CERES_CMD_FLUSH_RX_FIFO)
         self.rx_partial.clear()
         self.write_reg(AON_IRQ_STATUS, self.irq_status())
         # reg_bt_core.h: RXFIFO_ALMOST_FULL_LIMIT[5:0]，与每次读取量一致。
@@ -363,19 +383,19 @@ class Ceres:
         threshold = self.read_reg(MODEM_RXFIFO_CTRL) & 0x3F
         if threshold != RX_FIFO_THRESHOLD:
             raise RuntimeError(f"RX FIFO阈值回读异常: expected=48, actual={threshold}")
-        self.command(0xE3)  # SDK设置ACK payload；普通固定包长不请求ACK
-        for cmd in (0xA8, 0xA9, 0xAA):
+        self.command(CERES_CMD_REUSE_TX_PAYLOAD)  # SDK设置ACK payload；普通固定包长不请求ACK
+        for cmd in (CERES_CMD_WR_AUTOACK, CERES_CMD_WR_AUTOACK | 1, CERES_CMD_WR_AUTOACK | 2):
             self.command(cmd, b'\x01\x00\x55')
-        self.command(0xD5)
+        self.command(CERES_CMD_SET_CE)
 
     def rearm_rx(self):
         # 先停止和flush，再清状态。flush前清W1C会遗漏清理期间新产生的状态。
-        self.command(0xD6)
-        self.command(0xE2)
+        self.command(CERES_CMD_CLR_CE)
+        self.command(CERES_CMD_FLUSH_RX_FIFO)
         self.rx_partial.clear()
         pending = self.irq_status()
         self.write_reg(AON_IRQ_STATUS, pending)
-        self.command(0xD5)
+        self.command(CERES_CMD_SET_CE)
 
     def receive_packet(self):
         """drv_ceres_state_rx_handler(): 返回(crc_ok, payload)或None。"""
@@ -386,10 +406,14 @@ class Ceres:
                 if not crc_ok:
                     return False, b''
                 # SDK: RD_RX_LENGTH + rx_header_len；固定包长时后者为static_length。
-                size = self.read_data(0x60, 1)[0] + self.static_length
-                if size != self.static_length or len(self.rx_partial) > size:
+                size = self.read_data(CERES_CMD_RD_RX_LENGTH, 1)[0] + self.static_length
+                # 与预期长度不一致仍读取/打印，由RxStats归类为mismatch。
+                # 只拒绝超出SDK单包范围或小于已读取量的异常硬件长度。
+                if size > 255 or len(self.rx_partial) > size:
                     raise RuntimeError(f"RX长度状态异常: length={size}, fixed={self.static_length}")
-                self.rx_partial.extend(self.read_data(0x61, size - len(self.rx_partial)))
+                self.rx_partial.extend(self.read_data(CERES_CMD_RD_PAYLOAD, size - len(self.rx_partial)))
+                self.rx_count += 1
+                print(f"rx cnt:{self.rx_count}, data: {self.rx_partial.hex(' ').upper()}", flush=True)
                 self.rx_fifo_fault_streak = 0
                 return True, bytes(self.rx_partial)
             finally:
@@ -407,7 +431,7 @@ class Ceres:
                                        f"threshold={threshold}, fixed={self.static_length}")
                 self.rearm_rx()
                 return None
-            self.rx_partial.extend(self.read_data(0x61, RX_FIFO_THRESHOLD))
+            self.rx_partial.extend(self.read_data(CERES_CMD_RD_PAYLOAD, RX_FIFO_THRESHOLD))
             self.write_reg(AON_IRQ_STATUS, RXFIFO_ALMOST_FULL)
         return None
 
@@ -430,8 +454,8 @@ class Ceres:
             stats.report()
             active_error = sys.exc_info()[0] is not None
             try:
-                self.command(0xD6)
-                self.command(0xE2)
+                self.command(CERES_CMD_CLR_CE)
+                self.command(CERES_CMD_FLUSH_RX_FIFO)
             except (OSError, RuntimeError):
                 if not active_error:
                     raise
@@ -552,7 +576,7 @@ def parse_args(argv=None):
         parser.error('--out_rx_result_time必须是有限正毫秒数')
     if args.command is None and args.mode == 1:
         if not 1 <= args.len <= 63:
-            parser.error('RX --len必须在1..63之间（与wl160x_test_mode.py一致）')
+            parser.error('RX --len必须在1..63之间')
         if args.pkt_type == 'random':
             parser.error('RX不能用random生成预期数据')
     return args
